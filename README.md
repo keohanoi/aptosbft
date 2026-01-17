@@ -1,9 +1,8 @@
 # AptosBFT
 
-[![CI](https://github.com/aptos-labs/aptosbft/workflows/CI/badge.svg)](https://github.com/aptos-labs/aptosbft/actions)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-1.81%2B-orange.svg)
-[![Coverage](https://img.shields.io/badge/coverage-85.08%25-brightgreen.svg)
+![Coverage](https://img.shields.io/badge/coverage-85.08%25-brightgreen.svg)
 
 > A generic, blockchain-agnostic implementation of the AptosBFT consensus algorithm in Rust.
 
