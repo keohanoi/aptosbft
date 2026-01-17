@@ -186,6 +186,61 @@ AptosBFT uses the **2-chain commit rule** for safety:
 
 This rule ensures that all honest validators agree on committed blocks, providing **safety** (no forks) in an asynchronous network.
 
+### Implementation Note: 2-Chain vs 3-Chain Commit Rules
+
+> **Important**: This library implements the **2-chain commit rule**, which matches the actual production behavior of Aptos consensus. While some Aptos documentation references a 3-chain commit rule, the production implementation uses 2-chain.
+
+#### Visual Comparison
+
+```
+2-CHAIN COMMIT RULE (Implemented in AptosBFT)
+─────────────────────────────────────────────────────
+Block 0 (round N) ────┐
+        │             │ Commit Block 0 when Block 1 is certified
+        ▼             │
+Block 1 (round N+1) ──┘ (2-chain formed: N, N+1)
+        │
+        ▼
+Block 2 (round N+2)
+
+Result: Block 0 commits when Block 1 is certified (1 round latency)
+
+3-CHAIN COMMIT RULE (Documented in some Aptos docs, NOT implemented)
+─────────────────────────────────────────────────────
+Block 0 (round N) ────┐
+        │             │
+        ▼             │
+Block 1 (round N+1) ──┤ Commit Block 0 when Block 2 is certified
+        │             │ (3-chain formed: N, N+1, N+2)
+        ▼             │
+Block 2 (round N+2) ──┘
+        │
+        ▼
+Block 3 (round N+3)
+
+Result: Block 0 commits when Block 2 is certified (2 round latency)
+```
+
+#### Key Differences
+
+| Aspect | 2-Chain Rule | 3-Chain Rule |
+|--------|--------------|--------------|
+| **Blocks to Commit** | 2 consecutive certified blocks | 3 consecutive certified blocks |
+| **Commit Latency** | 1 round after parent certified | 2 rounds after parent certified |
+| **Safety** | ✅ Guaranteed | ✅ Enhanced safety |
+| **Implementation** | ✅ Production (this library) | Documented but not implemented |
+
+#### Code Evidence
+
+Both `/consensus/safety-rules/src/safety_rules_2chain.rs` and this library implement:
+
+```rust
+// verify 2-chain rule
+let commit = next_round(block0)? == block1;
+```
+
+This checks that `block1.round == block0.round + 1`, which is the **2-chain rule**, not 3-chain.
+
 ### Voting Rules
 
 A vote for block B is safe if **EITHER** condition is true:
