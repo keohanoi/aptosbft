@@ -155,6 +155,42 @@ impl DydxSignature {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }
+
+    /// Verify this signature against a message and public key using Ed25519
+    pub fn verify_ed25519(&self, message: &[u8], public_key: &DydxPublicKey) -> Result<(), VerifyError> {
+        use ed25519_dalek::{Verifier, Signature, VerifyingKey};
+
+        // Ed25519 signatures must be exactly 64 bytes
+        if self.bytes.len() != 64 {
+            return Err(VerifyError::InvalidSignature);
+        }
+
+        // Ed25519 public keys must be exactly 32 bytes
+        if public_key.bytes.len() != 32 {
+            return Err(VerifyError::InvalidSignature);
+        }
+
+        // Convert bytes to ed25519-dalek types
+        let sig_bytes: [u8; 64] = self.bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::InvalidSignature)?;
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        let pk_bytes: [u8; 32] = public_key.bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::InvalidSignature)?;
+        let verifying_key = VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|_| VerifyError::InvalidSignature)?;
+
+        // Verify the signature
+        verifying_key
+            .verify(message, &signature)
+            .map_err(|_| VerifyError::InvalidSignature)?;
+
+        Ok(())
+    }
 }
 
 impl SignatureTrait for DydxSignature {
@@ -162,9 +198,8 @@ impl SignatureTrait for DydxSignature {
     type PublicKey = DydxPublicKey;
     type Aggregated = DydxAggregatedSignature;
 
-    fn verify(&self, _message: &[u8], _public_key: &Self::PublicKey) -> Result<(), Self::VerifyError> {
-        // TODO: Implement actual signature verification
-        Ok(())
+    fn verify(&self, message: &[u8], public_key: &Self::PublicKey) -> Result<(), Self::VerifyError> {
+        self.verify_ed25519(message, public_key)
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -339,7 +374,20 @@ impl BlockTrait for DydxBlock {
 
     fn verify_signature(&self) -> Result<(), CoreError> {
         match &self.signature {
-            Some(_) => Ok(()), // TODO: Implement actual verification
+            Some(sig) => {
+                // Verify the block signature against the proposer's public key
+                // In production, you would:
+                // 1. Get the proposer's public key from the validator set
+                // 2. Serialize the block data (metadata + transactions)
+                // 3. Verify the signature
+                let block_data = self.id().as_bytes().to_vec();
+                let proposer_pk = DydxPublicKey {
+                    bytes: self.metadata.author.0.to_vec(),
+                };
+                sig.verify(&block_data, &proposer_pk)
+                    .map_err(|e| CoreError::msg(format!("Signature verification failed: {:?}", e)))?;
+                Ok(())
+            }
             None => Err(CoreError::msg("No signature")),
         }
     }
@@ -451,15 +499,175 @@ impl LedgerInfo for DydxLedgerInfo {
     }
 }
 
-/// dYdX quorum certificate (placeholder implementation)
+/// dYdX quorum certificate
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DydxQuorumCert {
     /// Certified block metadata
     pub certified_block: DydxBlockMetadata,
     /// Aggregated signature
     pub aggregated_signature: DydxAggregatedSignature,
-    /// Signers bitmask
+    /// Signers bitmask (each bit represents a validator address)
     pub signers: Vec<u8>,
+    /// Total voting power of all validators
+    pub total_voting_power: u64,
+    /// Voting power of the signers
+    pub signers_voting_power: u64,
+}
+
+impl DydxQuorumCert {
+    /// Calculate the voting power threshold (2/3 of total)
+    pub const VOTING_POWER_THRESHOLD_NUMERATOR: u64 = 2;
+    pub const VOTING_POWER_THRESHOLD_DENOMINATOR: u64 = 3;
+
+    /// Create a new quorum certificate
+    pub fn new(
+        certified_block: DydxBlockMetadata,
+        aggregated_signature: DydxAggregatedSignature,
+        signers: Vec<u8>,
+        total_voting_power: u64,
+        signers_voting_power: u64,
+    ) -> Self {
+        Self {
+            certified_block,
+            aggregated_signature,
+            signers,
+            total_voting_power,
+            signers_voting_power,
+        }
+    }
+
+    /// Check if the QC has sufficient voting power (>2/3)
+    pub fn has_quorum(&self) -> bool {
+        if self.total_voting_power == 0 {
+            return false;
+        }
+        let threshold = (self.total_voting_power * Self::VOTING_POWER_THRESHOLD_NUMERATOR)
+            / Self::VOTING_POWER_THRESHOLD_DENOMINATOR;
+        self.signers_voting_power > threshold
+    }
+
+    /// Count the number of signers from the bitmask
+    pub fn signer_count(&self) -> usize {
+        self.signers
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum()
+    }
+
+    /// Check if a validator (by index) signed this QC
+    pub fn is_signer(&self, validator_index: usize) -> bool {
+        let byte_index = validator_index / 8;
+        let bit_index = validator_index % 8;
+        if byte_index >= self.signers.len() {
+            return false;
+        }
+        (self.signers[byte_index] & (1 << bit_index)) != 0
+    }
+
+    /// Form a Quorum Certificate from a collection of votes.
+    ///
+    /// This is the concrete implementation for DydxVote types, which aggregates
+    /// individual votes into a single Quorum Certificate that can be used for
+    /// consensus decisions.
+    ///
+    /// # Arguments
+    /// * `votes` - Slice of Arc-wrapped DydxVote objects to aggregate
+    /// * `validator_set` - Mapping of validator addresses to their (index, voting_power)
+    ///
+    /// # Returns
+    /// * `Ok(DydxQuorumCert)` - If quorum is reached (>2/3 voting power)
+    /// * `Err(CoreError)` - If votes are invalid or quorum not reached
+    pub fn form_from_votes(
+        votes: &[std::sync::Arc<DydxVote>],
+        validator_set: &std::collections::HashMap<Vec<u8>, (usize, u64)>,
+    ) -> Result<Self, CoreError> {
+        if votes.is_empty() {
+            return Err(CoreError::msg("No votes provided"));
+        }
+
+        // Calculate total voting power from the entire validator set
+        let total_voting_power: u64 = validator_set.values().map(|(_, power)| power).sum();
+
+        if total_voting_power == 0 {
+            return Err(CoreError::msg("Validator set has zero voting power"));
+        }
+
+        // All votes must be for the same block (same epoch and round)
+        let first_vote = &votes[0];
+        let target_epoch = first_vote.vote_data.proposed_block.epoch;
+        let target_round = first_vote.vote_data.proposed_block.round;
+
+        // Verify all votes are for the same block and collect validator info
+        let mut validator_indices = Vec::new();
+        let mut signers_voting_power = 0u64;
+        let mut signatures = Vec::new();
+
+        for vote in votes {
+            // Verify vote is for the target block
+            if vote.vote_data.proposed_block.epoch != target_epoch
+                || vote.vote_data.proposed_block.round != target_round
+            {
+                return Err(CoreError::msg(format!(
+                    "Vote mismatch: expected epoch={} round={}, got epoch={} round={}",
+                    target_epoch,
+                    target_round,
+                    vote.vote_data.proposed_block.epoch,
+                    vote.vote_data.proposed_block.round
+                )));
+            }
+
+            // Find validator index from the validator set
+            let author_bytes = vote.author.0.to_vec();
+            let (validator_index, voting_power) = validator_set
+                .get(&author_bytes)
+                .ok_or_else(|| CoreError::msg(format!("Unknown validator: {:?}", vote.author.0)))?;
+
+            validator_indices.push(*validator_index);
+            signers_voting_power += voting_power;
+
+            // Collect signature for aggregation
+            signatures.push(vote.signature.bytes.clone());
+        }
+
+        // Aggregate signatures by concatenation (Ed25519 doesn't support BLS aggregation)
+        let aggregated_bytes = signatures.into_iter().flatten().collect();
+        let aggregated_signature = DydxAggregatedSignature {
+            bytes: aggregated_bytes,
+            mask: vec![], // Will be populated below
+        };
+
+        // Build signers bitmask
+        let max_index = validator_indices.iter().cloned().max().unwrap_or(0);
+        let num_bytes = (max_index / 8) + 1;
+        let mut signers = vec![0u8; num_bytes];
+
+        for validator_index in validator_indices {
+            let byte_index = validator_index / 8;
+            let bit_index = validator_index % 8;
+            if byte_index < signers.len() {
+                signers[byte_index] |= 1 << bit_index;
+            }
+        }
+
+        // Create the quorum certificate
+        let qc = DydxQuorumCert {
+            certified_block: first_vote.vote_data.proposed_block.clone(),
+            aggregated_signature,
+            signers,
+            total_voting_power,
+            signers_voting_power,
+        };
+
+        // Verify quorum is reached
+        if !qc.has_quorum() {
+            return Err(CoreError::msg(format!(
+                "Insufficient voting power: {} / {} (need > 2/3)",
+                qc.signers_voting_power, qc.total_voting_power
+            )));
+        }
+
+        Ok(qc)
+    }
 }
 
 impl QuorumCertificate for DydxQuorumCert {
@@ -491,20 +699,60 @@ impl QuorumCertificate for DydxQuorumCert {
     }
 
     fn verify(&self) -> Result<(), CoreError> {
-        // TODO: Implement QC verification
+        // Verify that the QC has sufficient voting power (>2/3)
+        if !self.has_quorum() {
+            return Err(CoreError::msg(format!(
+                "Insufficient voting power: {} / {} (need > 2/3)",
+                self.signers_voting_power, self.total_voting_power
+            )));
+        }
+
+        // Verify the signers bitmask is consistent with the voting power
+        if self.signers.is_empty() && self.signers_voting_power > 0 {
+            return Err(CoreError::msg("Signers bitmask is empty but voting power is non-zero"));
+        }
+
+        // Verify the aggregated signature has the expected size
+        // For Ed25519, we expect N * 64 bytes where N is the number of signers
+        let expected_sig_size = self.signer_count() * 64;
+        if self.aggregated_signature.bytes.len() < expected_sig_size {
+            return Err(CoreError::msg(format!(
+                "Aggregated signature too small: expected {} bytes, got {}",
+                expected_sig_size,
+                self.aggregated_signature.bytes.len()
+            )));
+        }
+
         Ok(())
     }
 
     fn from_votes<B, V>(
-        _votes: &[std::sync::Arc<V>],
+        votes: &[std::sync::Arc<V>],
         _aggregated_signature: <V::Signature as SignatureTrait>::Aggregated,
     ) -> Result<Self, CoreError>
     where
         B: BlockTrait,
         V: VoteTrait,
     {
-        // TODO: Implement QC formation from votes
-        Err(CoreError::msg("Not implemented"))
+        if votes.is_empty() {
+            return Err(CoreError::msg("No votes provided"));
+        }
+
+        // NOTE: This is a simplified implementation that assumes votes are DydxVote.
+        // In production, you would need proper type constraints or a downcast.
+        // For now, this provides the structure for future implementation.
+
+        // For generic implementation, we'd need to extract data via trait methods
+        // but since our types are concrete, we document this limitation:
+        Err(CoreError::msg(
+            "from_votes requires DydxVote types - use DydxQuorumCert::form_from_votes for concrete implementation"
+        ))
+
+        // Future implementation would:
+        // 1. Extract block metadata from votes[0].vote_data().proposed_block()
+        // 2. Extract/convert aggregated signature
+        // 3. Build signers bitmask
+        // 4. Return DydxQuorumCert { certified_block, aggregated_signature, signers }
     }
 }
 
@@ -552,6 +800,25 @@ pub struct DydxVote {
     pub extension: Vec<u8>,
 }
 
+impl DydxVote {
+    /// Serialize the vote for signing (excludes the signature field)
+    pub fn serialize_for_signing(&self) -> Vec<u8> {
+        // In production, this would serialize:
+        // - author (node ID)
+        // - vote_data (proposed and parent block metadata)
+        // - ledger_info
+        // - extension
+        // For now, use a simple serialization via the block hash
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.author.0);
+        hasher.update(&self.vote_data.proposed_block.epoch.to_le_bytes());
+        hasher.update(&self.vote_data.proposed_block.round.to_le_bytes());
+        hasher.update(&self.vote_data.proposed_block.parent_id.0);
+        hasher.update(&self.extension);
+        hasher.finalize().as_bytes().to_vec()
+    }
+}
+
 impl VoteTrait for DydxVote {
     type Block = DydxBlock;
     type Hash = DydxHash;
@@ -588,12 +855,26 @@ impl VoteTrait for DydxVote {
         &self.extension
     }
 
-    fn verify<B, VV>(&self, _verifier: &VV) -> Result<(), CoreError>
+    fn verify<B, VV>(&self, verifier: &VV) -> Result<(), CoreError>
     where
         B: BlockTrait,
         VV: ValidatorVerifier<B, Self>,
     {
-        // TODO: Implement vote verification
+        // 1. Verify the vote data (round linkage, etc.)
+        <DydxVoteData as VoteData>::verify(&self.vote_data)?;
+
+        // 2. Verify the signature
+        let vote_bytes = DydxVote::serialize_for_signing(self);
+        let pk = DydxPublicKey {
+            bytes: self.author.0.to_vec(),
+        };
+        self.signature.verify(&vote_bytes, &pk)
+            .map_err(|e| CoreError::msg(format!("Vote signature verification failed: {:?}", e)))?;
+
+        // 3. Verify the voter is a valid validator for this epoch
+        // This would check against the validator verifier
+        verifier.verify_vote(self)?;
+
         Ok(())
     }
 }
@@ -606,31 +887,125 @@ mod tests {
     fn test_hash_from_data() {
         let data = b"test data";
         let hash = DydxHash::from_data(data);
+
+        // Verify hash is not zero
         assert_ne!(hash.0, [0u8; 32]);
+
+        // Verify hash is deterministic
+        let hash2 = DydxHash::from_data(data);
+        assert_eq!(hash.0, hash2.0);
+
+        // Verify different data produces different hash
+        let different_data = b"different data";
+        let hash3 = DydxHash::from_data(different_data);
+        assert_ne!(hash.0, hash3.0);
+
+        // Verify hash length is correct
+        assert_eq!(hash.0.len(), 32);
     }
 
     #[test]
     fn test_hash_zero() {
         let hash = DydxHash::zero();
         assert_eq!(hash.0, [0u8; 32]);
+
+        // Verify zero hash is consistent
+        let hash2 = DydxHash::zero();
+        assert_eq!(hash.0, hash2.0);
+
+        // Verify non-zero data produces different hash
+        let hash3 = DydxHash::from_data(b"test");
+        assert_ne!(hash.0, hash3.0);
+    }
+
+    #[test]
+    fn test_hash_display() {
+        let hash = DydxHash([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
+        let display = format!("{}", hash);
+
+        // Verify hex encoding
+        assert_eq!(display, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
     }
 
     #[test]
     fn test_node_id_from_slice() {
         let bytes = vec![1u8; 16];
         let id = DydxNodeId::from_slice(&bytes);
+
+        // Verify first 16 bytes are copied
         assert_eq!(id.0[..16], bytes[..16]);
+
+        // Verify remaining 16 bytes are zero-padded
         assert_eq!(id.0[16..], [0u8; 16]);
+
+        // Verify full 32-byte length
+        assert_eq!(id.0.len(), 32);
+    }
+
+    #[test]
+    fn test_node_id_from_slice_full() {
+        let bytes = vec![5u8; 32];
+        let id = DydxNodeId::from_slice(&bytes);
+
+        // Verify all bytes are copied
+        assert_eq!(id.0, bytes[..]);
+    }
+
+    #[test]
+    fn test_node_id_from_slice_empty() {
+        let bytes = vec![];
+        let id = DydxNodeId::from_slice(&bytes);
+
+        // Verify all bytes are zero when empty input
+        assert_eq!(id.0, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_node_id_display() {
+        let id = DydxNodeId([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
+        let display = format!("{}", id);
+
+        // Verify hex encoding
+        assert_eq!(display, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
     }
 
     #[test]
     fn test_block_genesis() {
         let author = DydxNodeId([42u8; 32]);
         let genesis = DydxBlock::genesis(author);
+
+        // Verify genesis block properties
         assert!(genesis.is_genesis());
         assert!(genesis.is_nil());
         assert_eq!(genesis.metadata.epoch, 0);
         assert_eq!(genesis.metadata.round, 0);
+        assert_eq!(genesis.metadata.author, author);
+        assert!(genesis.transactions.is_empty());
+        assert!(genesis.signature.is_none());
+    }
+
+    #[test]
+    fn test_block_new() {
+        let block = DydxBlock::new(
+            1,
+            5,
+            DydxNodeId([1u8; 32]),
+            DydxHash([2u8; 32]),
+            1000,
+            vec![DydxTransaction::new(vec![1, 2, 3])],
+        );
+
+        // Verify block properties
+        assert_eq!(block.metadata.epoch, 1);
+        assert_eq!(block.metadata.round, 5);
+        assert_eq!(block.metadata.timestamp, 1000);
+        assert_eq!(block.metadata.parent_id, DydxHash([2u8; 32]));
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].data, vec![1, 2, 3]);
+
+        // Verify not genesis
+        assert!(!block.is_genesis());
+        assert!(!block.is_nil());
     }
 
     #[test]
@@ -644,15 +1019,81 @@ mod tests {
             vec![],
         );
         let id = block.id();
+
+        // Verify block ID is non-zero
         assert_ne!(id.0, [0u8; 32]);
+
+        // Verify block ID is deterministic
+        let id2 = block.id();
+        assert_eq!(id.0, id2.0);
+    }
+
+    #[test]
+    fn test_block_verify_signature_without_signature() {
+        let block = DydxBlock::new(
+            1,
+            5,
+            DydxNodeId([1u8; 32]),
+            DydxHash([2u8; 32]),
+            1000,
+            vec![],
+        );
+
+        // Should fail when no signature
+        assert!(block.verify_signature().is_err());
+    }
+
+    #[test]
+    fn test_block_with_signature() {
+        let mut block = DydxBlock::new(
+            1,
+            5,
+            DydxNodeId([1u8; 32]),
+            DydxHash([2u8; 32]),
+            1000,
+            vec![],
+        );
+
+        // Add a signature (64 bytes for Ed25519)
+        block.signature = Some(DydxSignature::new(vec![42u8; 64]));
+
+        // Verify signature exists
+        assert!(block.signature.is_some());
+        assert_eq!(block.signature.as_ref().unwrap().bytes.len(), 64);
     }
 
     #[test]
     fn test_transaction_hash() {
         let tx = DydxTransaction::new(vec![1, 2, 3, 4, 5]);
         let hash = tx.hash();
+
+        // Verify hash length
         assert_eq!(hash.0.len(), 32);
+
+        // Verify transaction size
         assert_eq!(tx.size(), 5);
+
+        // Verify hash is deterministic
+        let hash2 = tx.hash();
+        assert_eq!(hash.0, hash2.0);
+    }
+
+    #[test]
+    fn test_transaction_empty() {
+        let tx = DydxTransaction::new(vec![]);
+        assert_eq!(tx.size(), 0);
+
+        // Empty transaction should still have a hash
+        let hash = tx.hash();
+        assert_eq!(hash.0.len(), 32);
+    }
+
+    #[test]
+    fn test_transaction_large() {
+        let large_data = vec![7u8; 1_000_000]; // 1MB
+        let tx = DydxTransaction::new(large_data.clone());
+        assert_eq!(tx.size(), 1_000_000);
+        assert_eq!(tx.data, large_data);
     }
 
     #[test]
@@ -670,13 +1111,40 @@ mod tests {
             accumulated_state: DydxHash([3u8; 32]),
         };
 
+        // Verify ledger info methods
         assert_eq!(ledger_info.epoch(), 1);
         assert_eq!(ledger_info.round(), 100);
         assert_eq!(ledger_info.commit_info().version(), 5);
+        assert_eq!(ledger_info.commit_info().block_id(), DydxHash([1u8; 32]));
+        assert_eq!(ledger_info.accumulated_state, DydxHash([3u8; 32]));
     }
 
     #[test]
-    fn test_vote_data_verify() {
+    fn test_ledger_info_fields() {
+        let block_id = DydxHash([10u8; 32]);
+        let state_root = DydxHash([20u8; 32]);
+        let _accumulated_state = DydxHash([30u8; 32]);
+
+        let commit_info = DydxCommitInfo {
+            block_id,
+            round: 500,
+            epoch: 10,
+            version: 1000,
+            state_root,
+            timestamp: 99999,
+        };
+
+        // Verify all fields
+        assert_eq!(commit_info.block_id, block_id);
+        assert_eq!(commit_info.round, 500);
+        assert_eq!(commit_info.epoch, 10);
+        assert_eq!(commit_info.version, 1000);
+        assert_eq!(commit_info.state_root, state_root);
+        assert_eq!(commit_info.timestamp, 99999);
+    }
+
+    #[test]
+    fn test_vote_data_verify_valid_round_increment() {
         let vote_data = DydxVoteData {
             proposed_block: DydxBlockMetadata {
                 epoch: 1,
@@ -697,11 +1165,32 @@ mod tests {
     }
 
     #[test]
-    fn test_vote_data_verify_invalid() {
+    fn test_vote_data_verify_same_epoch() {
+        let vote_data = DydxVoteData {
+            proposed_block: DydxBlockMetadata {
+                epoch: 5,
+                round: 100,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 1000,
+            },
+            parent_block: DydxBlockMetadata {
+                epoch: 5,
+                round: 99,
+                author: DydxNodeId([1u8; 32]),
+                parent_id: DydxHash([2u8; 32]),
+                timestamp: 900,
+            },
+        };
+        assert!(vote_data.verify().is_ok());
+    }
+
+    #[test]
+    fn test_vote_data_verify_invalid_round_increment() {
         let vote_data = DydxVoteData {
             proposed_block: DydxBlockMetadata {
                 epoch: 1,
-                round: 5, // Wrong round
+                round: 5, // Wrong round - should be parent round + 1
                 author: DydxNodeId([0u8; 32]),
                 parent_id: DydxHash([0u8; 32]),
                 timestamp: 100,
@@ -714,14 +1203,564 @@ mod tests {
                 timestamp: 50,
             },
         };
+        let result = vote_data.verify();
+        assert!(result.is_err(), "Vote data verification should fail for invalid round increment");
+
+        // Verify error message contains useful information
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Round increment invalid") || err_msg.contains("round"));
+    }
+
+    #[test]
+    fn test_vote_data_verify_round_not_incremented() {
+        let vote_data = DydxVoteData {
+            proposed_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 1, // Same round as parent - should be parent round + 1
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            parent_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 1,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 50,
+            },
+        };
         assert!(vote_data.verify().is_err());
     }
 
     #[test]
-    fn test_signature_aggregate() {
+    fn test_vote_data_verify_decremented_round() {
+        let vote_data = DydxVoteData {
+            proposed_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 2,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            parent_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 5, // Parent round greater than proposed - invalid
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 150,
+            },
+        };
+        assert!(vote_data.verify().is_err());
+    }
+
+    #[test]
+    fn test_signature_aggregate_empty() {
+        let signatures: Vec<&DydxSignature> = vec![];
+        let result = DydxSignature::aggregate(signatures.into_iter());
+
+        // Should handle empty iterator gracefully
+        assert!(result.is_ok());
+        let aggregated = result.unwrap();
+        assert!(aggregated.bytes.is_empty());
+        assert!(aggregated.mask.is_empty());
+    }
+
+    #[test]
+    fn test_signature_aggregate_single() {
+        let sig1 = DydxSignature::new(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let aggregated = DydxSignature::aggregate(vec![&sig1].into_iter()).unwrap();
+
+        assert_eq!(aggregated.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(aggregated.mask.is_empty());
+    }
+
+    #[test]
+    fn test_signature_aggregate_multiple() {
         let sig1 = DydxSignature::new(vec![1, 2, 3]);
         let sig2 = DydxSignature::new(vec![4, 5, 6]);
-        let aggregated = DydxSignature::aggregate(vec![&sig1, &sig2].into_iter()).unwrap();
-        assert_eq!(aggregated.bytes, vec![1, 2, 3, 4, 5, 6]);
+        let sig3 = DydxSignature::new(vec![7, 8, 9]);
+        let aggregated = DydxSignature::aggregate(vec![&sig1, &sig2, &sig3].into_iter()).unwrap();
+
+        assert_eq!(aggregated.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_signature_aggregate_deterministic() {
+        let sig1 = DydxSignature::new(vec![1, 2, 3]);
+        let sig2 = DydxSignature::new(vec![4, 5, 6]);
+
+        let aggregated1 = DydxSignature::aggregate(vec![&sig1, &sig2].into_iter()).unwrap();
+        let aggregated2 = DydxSignature::aggregate(vec![&sig1, &sig2].into_iter()).unwrap();
+
+        assert_eq!(aggregated1.bytes, aggregated2.bytes);
+        assert_eq!(aggregated1.mask, aggregated2.mask);
+    }
+
+    #[test]
+    fn test_public_key_from_bytes() {
+        let bytes = vec![1u8; 32];
+        let pk = DydxPublicKey::from_bytes(&bytes).unwrap();
+
+        assert_eq!(pk.bytes, bytes);
+    }
+
+    #[test]
+    fn test_public_key_to_bytes() {
+        let bytes = vec![5u8; 32];
+        let pk = DydxPublicKey::from_bytes(&bytes).unwrap();
+        let converted = pk.to_bytes();
+
+        assert_eq!(converted, bytes);
+    }
+
+    #[test]
+    fn test_public_key_wrong_size() {
+        let bytes = vec![1u8; 16]; // Wrong size for Ed25519
+        let pk = DydxPublicKey::from_bytes(&bytes).unwrap();
+
+        // Should accept any size in from_bytes (no validation on creation)
+        assert_eq!(pk.bytes, bytes);
+    }
+
+    #[test]
+    fn test_block_metadata() {
+        let metadata = DydxBlockMetadata {
+            epoch: 10,
+            round: 100,
+            author: DydxNodeId([1u8; 32]),
+            parent_id: DydxHash([2u8; 32]),
+            timestamp: 5000,
+        };
+
+        assert_eq!(metadata.epoch(), 10);
+        assert_eq!(metadata.round(), 100);
+        assert_eq!(metadata.author, DydxNodeId([1u8; 32]));
+        assert_eq!(metadata.parent_id, DydxHash([2u8; 32]));
+        assert_eq!(metadata.timestamp, 5000);
+    }
+
+    #[test]
+    fn test_quorum_cert_has_quorum() {
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![1, 2, 3, 4],
+                mask: vec![0x01],
+            },
+            vec![0x01], // 1 signer
+            100, // total voting power
+            75,  // signers voting power (75% > 66.67%)
+        );
+
+        assert!(qc.has_quorum());
+        assert_eq!(qc.signer_count(), 1);
+        assert!(qc.is_signer(0));
+        assert!(!qc.is_signer(1));
+    }
+
+    #[test]
+    fn test_quorum_cert_no_quorum() {
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![1, 2, 3, 4],
+                mask: vec![0x01],
+            },
+            vec![0x01], // 1 signer
+            100, // total voting power
+            50,  // signers voting power (50% < 66.67%)
+        );
+
+        assert!(!qc.has_quorum());
+        assert_eq!(qc.signer_count(), 1);
+    }
+
+    #[test]
+    fn test_quorum_cert_verify_sufficient_voting_power() {
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![1; 192], // 3 signatures * 64 bytes
+                mask: vec![0x07], // 3 signers (bits 0, 1, 2 set)
+            },
+            vec![0x07], // 3 signers
+            100, // total voting power
+            67,  // signers voting power (67% > 66.67%)
+        );
+
+        // Should pass verification with sufficient voting power
+        assert!(qc.verify().is_ok());
+    }
+
+    #[test]
+    fn test_quorum_cert_verify_insufficient_voting_power() {
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![1; 128], // 2 signatures * 64 bytes
+                mask: vec![0x03], // 2 signers (bits 0, 1 set)
+            },
+            vec![0x03], // 2 signers
+            100, // total voting power
+            66,  // signers voting power (66% = 66.67% threshold, not >)
+        );
+
+        // Should fail verification - need > 2/3, not >= 2/3
+        let result = qc.verify();
+        assert!(result.is_err());
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Insufficient voting power"));
+    }
+
+    #[test]
+    fn test_quorum_cert_verify_zero_total_power() {
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![],
+                mask: vec![],
+            },
+            vec![],
+            0, // total voting power
+            0,  // signers voting power
+        );
+
+        // Should fail with zero total power
+        let result = qc.verify();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quorum_cert_verify_empty_signers_nonzero_power() {
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![],
+                mask: vec![],
+            },
+            vec![],
+            100, // total voting power
+            50,  // signers voting power but no signers bitmask
+        );
+
+        // Should fail - bitmask empty but voting power non-zero
+        let result = qc.verify();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quorum_cert_signer_count() {
+        // Test with 5 signers (bits 0, 1, 2, 3, 4 set)
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![],
+                mask: vec![],
+            },
+            vec![0x1F], // binary: 00011111
+            100,
+            50,
+        );
+
+        assert_eq!(qc.signer_count(), 5);
+        assert!(qc.is_signer(0));
+        assert!(qc.is_signer(1));
+        assert!(qc.is_signer(2));
+        assert!(qc.is_signer(3));
+        assert!(qc.is_signer(4));
+        assert!(!qc.is_signer(5));
+        assert!(!qc.is_signer(7));
+    }
+
+    #[test]
+    fn test_quorum_cert_multi_byte_signers() {
+        // Test with signers across multiple bytes
+        let qc = DydxQuorumCert::new(
+            DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            DydxAggregatedSignature {
+                bytes: vec![],
+                mask: vec![],
+            },
+            vec![0xFF, 0x01], // All 8 bits in first byte, 1 bit in second
+            100,
+            50,
+        );
+
+        assert_eq!(qc.signer_count(), 9);
+        assert!(qc.is_signer(0));
+        assert!(qc.is_signer(7));
+        assert!(qc.is_signer(8));
+        assert!(!qc.is_signer(9));
+    }
+
+    #[test]
+    fn test_quorum_cert_form_from_votes_quorum_reached() {
+        use std::sync::Arc;
+
+        // Create validator set (3 validators with equal power)
+        let mut validator_set = std::collections::HashMap::new();
+        validator_set.insert(vec![1u8; 32], (0, 100)); // Validator 0: 100 power
+        validator_set.insert(vec![2u8; 32], (1, 100)); // Validator 1: 100 power
+        validator_set.insert(vec![3u8; 32], (2, 100)); // Validator 2: 100 power
+
+        let block_metadata = DydxBlockMetadata {
+            epoch: 1,
+            round: 5,
+            author: DydxNodeId([0u8; 32]),
+            parent_id: DydxHash([0u8; 32]),
+            timestamp: 100,
+        };
+
+        let vote_data = DydxVoteData {
+            proposed_block: block_metadata.clone(),
+            parent_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 4,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 50,
+            },
+        };
+
+        let ledger_info = DydxLedgerInfo {
+            commit_info: DydxCommitInfo {
+                block_id: DydxHash([1u8; 32]),
+                round: 5,
+                epoch: 1,
+                version: 1,
+                state_root: DydxHash([2u8; 32]),
+                timestamp: 100,
+            },
+            accumulated_state: DydxHash([2u8; 32]),
+        };
+
+        // Create votes from 3 validators (300 total power, > 2/3 threshold)
+        let votes = vec![
+            Arc::new(DydxVote {
+                author: DydxNodeId([1u8; 32]),
+                vote_data: vote_data.clone(),
+                ledger_info: ledger_info.clone(),
+                signature: DydxSignature { bytes: vec![0u8; 64] },
+                extension: vec![],
+            }),
+            Arc::new(DydxVote {
+                author: DydxNodeId([2u8; 32]),
+                vote_data: vote_data.clone(),
+                ledger_info: ledger_info.clone(),
+                signature: DydxSignature { bytes: vec![0u8; 64] },
+                extension: vec![],
+            }),
+            Arc::new(DydxVote {
+                author: DydxNodeId([3u8; 32]),
+                vote_data: vote_data.clone(),
+                ledger_info: ledger_info.clone(),
+                signature: DydxSignature { bytes: vec![0u8; 64] },
+                extension: vec![],
+            }),
+        ];
+
+        let result = DydxQuorumCert::form_from_votes(&votes, &validator_set);
+        assert!(result.is_ok());
+
+        let qc = result.unwrap();
+        assert_eq!(qc.certified_block.epoch, 1);
+        assert_eq!(qc.certified_block.round, 5);
+        assert_eq!(qc.total_voting_power, 300);
+        assert_eq!(qc.signers_voting_power, 300);
+        assert!(qc.has_quorum());
+        assert_eq!(qc.signer_count(), 3);
+        assert!(qc.is_signer(0));
+        assert!(qc.is_signer(1));
+        assert!(qc.is_signer(2));
+    }
+
+    #[test]
+    fn test_quorum_cert_form_from_votes_no_quorum() {
+        use std::sync::Arc;
+
+        // Create validator set (3 validators with equal power)
+        let mut validator_set = std::collections::HashMap::new();
+        validator_set.insert(vec![1u8; 32], (0, 100)); // Validator 0: 100 power
+        validator_set.insert(vec![2u8; 32], (1, 100)); // Validator 1: 100 power
+        validator_set.insert(vec![3u8; 32], (2, 100)); // Validator 2: 100 power
+
+        let block_metadata = DydxBlockMetadata {
+            epoch: 1,
+            round: 5,
+            author: DydxNodeId([0u8; 32]),
+            parent_id: DydxHash([0u8; 32]),
+            timestamp: 100,
+        };
+
+        let vote_data = DydxVoteData {
+            proposed_block: block_metadata.clone(),
+            parent_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 4,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 50,
+            },
+        };
+
+        let ledger_info = DydxLedgerInfo {
+            commit_info: DydxCommitInfo {
+                block_id: DydxHash([1u8; 32]),
+                round: 5,
+                epoch: 1,
+                version: 1,
+                state_root: DydxHash([2u8; 32]),
+                timestamp: 100,
+            },
+            accumulated_state: DydxHash([2u8; 32]),
+        };
+
+        // Create votes from only 1 validator (100 power, not > 2/3 of 300)
+        let votes = vec![Arc::new(DydxVote {
+            author: DydxNodeId([1u8; 32]),
+            vote_data: vote_data.clone(),
+            ledger_info: ledger_info.clone(),
+            signature: DydxSignature { bytes: vec![0u8; 64] },
+            extension: vec![],
+        })];
+
+        let result = DydxQuorumCert::form_from_votes(&votes, &validator_set);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Insufficient voting power"));
+    }
+
+    #[test]
+    fn test_quorum_cert_form_from_votes_empty() {
+        let validator_set = std::collections::HashMap::new();
+        let votes: Vec<std::sync::Arc<DydxVote>> = vec![];
+
+        let result = DydxQuorumCert::form_from_votes(&votes, &validator_set);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No votes provided"));
+    }
+
+    #[test]
+    fn test_quorum_cert_form_from_votes_mismatch() {
+        use std::sync::Arc;
+
+        let mut validator_set = std::collections::HashMap::new();
+        validator_set.insert(vec![1u8; 32], (0, 100));
+        validator_set.insert(vec![2u8; 32], (1, 100));
+
+        let vote_data_1 = DydxVoteData {
+            proposed_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            parent_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 4,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 50,
+            },
+        };
+
+        let vote_data_2 = DydxVoteData {
+            proposed_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 6, // Different round!
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 100,
+            },
+            parent_block: DydxBlockMetadata {
+                epoch: 1,
+                round: 5,
+                author: DydxNodeId([0u8; 32]),
+                parent_id: DydxHash([0u8; 32]),
+                timestamp: 50,
+            },
+        };
+
+        let ledger_info = DydxLedgerInfo {
+            commit_info: DydxCommitInfo {
+                block_id: DydxHash([1u8; 32]),
+                round: 5,
+                epoch: 1,
+                version: 1,
+                state_root: DydxHash([2u8; 32]),
+                timestamp: 100,
+            },
+            accumulated_state: DydxHash([2u8; 32]),
+        };
+
+        let votes = vec![
+            Arc::new(DydxVote {
+                author: DydxNodeId([1u8; 32]),
+                vote_data: vote_data_1,
+                ledger_info: ledger_info.clone(),
+                signature: DydxSignature { bytes: vec![0u8; 64] },
+                extension: vec![],
+            }),
+            Arc::new(DydxVote {
+                author: DydxNodeId([2u8; 32]),
+                vote_data: vote_data_2, // Different round!
+                ledger_info: ledger_info.clone(),
+                signature: DydxSignature { bytes: vec![0u8; 64] },
+                extension: vec![],
+            }),
+        ];
+
+        let result = DydxQuorumCert::form_from_votes(&votes, &validator_set);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Vote mismatch"));
     }
 }

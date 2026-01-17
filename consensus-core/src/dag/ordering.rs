@@ -8,7 +8,7 @@
 //! for DAG-based consensus.
 
 use consensus_traits::{
-    dag::{CertifiedNode, DagNode, DagNodeMetadata},
+    dag::CertifiedNode,
     core::Hash as HashTrait,
 };
 use std::{
@@ -127,7 +127,7 @@ where
     type Round = R;
     type Author = A;
 
-    fn get_anchor(&self, round: &Self::Round) -> Self::Author {
+    fn get_anchor(&self, _round: &Self::Round) -> Self::Author {
         // Simplified: just cycle through authors
         let index = 0; // Placeholder - in production, use round number
         self.authors
@@ -168,6 +168,7 @@ where
     lowest_unordered_round: R,
 
     /// Configuration
+    #[allow(dead_code)]
     config: OrderingConfig,
 }
 
@@ -248,13 +249,13 @@ where
     }
 
     /// Create a commit event for ordered nodes.
+    #[allow(dead_code)]
     fn create_commit_event(
         &self,
         _ordered_nodes: &[Arc<N>],
     ) -> CommitEvent<R, A> {
         // Simplified: return empty commit event
         // In production, this would extract actual information
-        use std::collections::HashSet;
         CommitEvent::new(
             self.lowest_unordered_round.clone(), // Placeholder
             vec![],
@@ -263,6 +264,7 @@ where
     }
 
     /// Check if the given round has enough votes to trigger ordering.
+    #[allow(dead_code)]
     fn can_trigger_ordering(&self, _round: &R) -> bool {
         // Simplified: return false
         // In production, this would check if we have 2f+1 voting power
@@ -270,6 +272,7 @@ where
     }
 
     /// Compare two rounds.
+    #[allow(dead_code)]
     fn compare_rounds(&self, _r1: &R, _r2: &R) -> std::cmp::Ordering {
         // Simplified: assume equal
         // In production, R would implement Ord
@@ -277,6 +280,7 @@ where
     }
 
     /// Get the next round.
+    #[allow(dead_code)]
     fn next_round(&self, round: R) -> R {
         // Simplified: return same round
         // In production, this would add 1 to the round
@@ -287,7 +291,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::testing::{TestRound, TestAuthor, TestNodeId, TestMetadata, TestPayload, TestParents, TestNode, TestCertificate, TestCertifiedNode, TestNodeBuilder, create_test_authors};
+    use crate::dag::testing::{TestRound, TestAuthor, TestCertifiedNode, TestNodeBuilder};
     use std::sync::Arc;
 
     #[test]

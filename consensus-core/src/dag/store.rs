@@ -15,7 +15,6 @@ use consensus_traits::{
 use crate::dag::types::DagNodeId;
 use std::{
     collections::{BTreeMap, HashMap},
-    fmt,
     hash::Hash as StdHash,
     sync::Arc,
 };
@@ -114,6 +113,7 @@ where
     author_to_index: HashMap<A, usize>,
 
     /// Configuration
+    #[allow(dead_code)]
     config: DagStoreConfig,
 }
 
@@ -332,11 +332,12 @@ mod tests {
         DagNodeId, DagNodeMetadataImpl, DagNodeImpl, DagPayloadImpl, ParentCertificatesImpl,
         NodeCertificateImpl, CertifiedNodeImpl,
     };
-    use std::sync::Arc;
+    use std::fmt;
     use std::hash::Hash as StdHash;
 
     // Test types with HashTrait implementation
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, StdHash)]
+    #[allow(dead_code)]
     struct TestEpoch(u64);
 
     impl fmt::Display for TestEpoch {

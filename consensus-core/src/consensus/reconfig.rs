@@ -7,19 +7,18 @@
 //! ensuring safe reconfiguration of the consensus protocol.
 
 use consensus_traits::{
-    block::{Block, BlockMetadata, QuorumCertificate},
+    block::{Block, BlockMetadata},
     core::Hash as HashTrait,
     proposer::ProposerElection,
 };
 use std::{
-    collections::{HashMap, HashSet},
-    fmt::{self, Debug},
-    sync::Arc,
+    collections::HashMap,
+    fmt::Debug,
 };
 use anyhow::{ensure, Result};
 
 use crate::{
-    epoch_manager::{EpochManager, EpochManagerConfig},
+    epoch_manager::EpochManager,
     types::{Epoch, Round},
 };
 
@@ -520,6 +519,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epoch_manager::EpochManagerConfig;
     use std::hash::Hash as StdHash;
 
     // Test author type

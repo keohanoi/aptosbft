@@ -1,6 +1,10 @@
-#[allow(dead_code)]
 // Copyright (c) Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
+
+// Module-level attributes come first
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 /// DAG consensus driver.
 ///

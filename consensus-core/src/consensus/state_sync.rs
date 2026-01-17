@@ -6,13 +6,10 @@
 //! This module handles synchronization of consensus state when a node
 //! falls behind the network, allowing it to catch up safely.
 
-use consensus_traits::{
-    block::{Block, BlockMetadata, QuorumCertificate},
-    core::Hash as HashTrait,
-};
+use consensus_traits::block::{Block, BlockMetadata};
 use std::{
     collections::HashMap,
-    fmt::{self, Debug},
+    fmt::Debug,
     sync::Arc,
 };
 use anyhow::{ensure, Result};
@@ -469,8 +466,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockBlock, MockBlockMetadata, MockNodeId, MockHash};
-    use std::hash::Hash as StdHash;
+    use crate::testing::{MockBlock, MockBlockMetadata, MockHash};
 
     fn create_test_block(round: u64) -> Arc<MockBlock> {
         let metadata = MockBlockMetadata::new(

@@ -20,6 +20,7 @@ serde_json = "1.0"
 blake3 = "1.5"
 hex = "0.4"
 chrono = "0.4"
+ed25519-dalek = "2.1"
 
 consensus-grpc-protos = { path = "../consensus-grpc-protos" }
 consensus-traits = { path = "../consensus-traits" }

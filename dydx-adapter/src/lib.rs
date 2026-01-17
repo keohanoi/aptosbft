@@ -15,8 +15,8 @@ pub mod types;
 pub mod state_computer;
 pub mod mempool_stream;
 pub mod ibc_headers;
-
-// pub mod vote_extensions;
+pub mod dydx_service;
+pub mod vote_extensions;
 
 pub use error::DydxAdapterError;
 pub use mempool_stream::{MempoolSyncStream, MempoolSyncConfig, create_mempool_sync_stream};
@@ -47,3 +47,8 @@ pub use types::{
     DydxBlockMetadata,
 };
 pub use state_computer::DydxStateComputer;
+pub use vote_extensions::{
+    DydxVoteExtension,
+    DydxVoteExtensionGenerator,
+    VoteExtensionGenerator,
+};

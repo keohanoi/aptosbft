@@ -1,7 +1,9 @@
 // Copyright (c) Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+// Module-level attributes
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 //! DAG testing utilities and helpers.
 //!
