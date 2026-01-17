@@ -463,6 +463,17 @@ pub trait Vote: Clone + Send + Sync + 'static {
     /// Get the round this vote is for.
     fn round(&self) -> u64;
 
+    /// Get the vote extension data.
+    ///
+    /// Vote extensions allow applications to inject arbitrary data into votes
+    /// (e.g., oracle prices for dYdX v4). The extension is signed along with
+    /// the vote data and can be verified by other validators.
+    ///
+    /// Returns an empty byte vector if no extension is present.
+    fn extension(&self) -> &[u8] {
+        &[]
+    }
+
     /// Verify this vote.
     ///
     /// # Errors

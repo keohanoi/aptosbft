@@ -1,0 +1,24 @@
+[package]
+name = "consensus-grpc-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC server implementation for AptosBFT consensus bridge"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+futures = { workspace = true }
+
+consensus-grpc-protos = { path = "../consensus-grpc-protos" }
+consensus-traits = { path = "../consensus-traits" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-stream = "0.1"

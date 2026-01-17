@@ -11,3 +11,6 @@ anyhow = "1.0"
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

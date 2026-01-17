@@ -47,11 +47,13 @@ pub mod testing;
 pub mod timeout;
 pub mod types;
 pub mod votes;
+pub mod vote_extensions;
 
 // Re-export commonly used types
 pub use types::{Epoch, Round};
 pub use safety_rules::{SafetyStateData, TwoChainSafetyRules};
 pub use timeout::{TwoChainTimeout, TwoChainTimeoutCertificate};
+pub use vote_extensions::VoteExtensionManager;
 
 /// Error type for consensus operations
 pub use consensus_traits::core::Error;

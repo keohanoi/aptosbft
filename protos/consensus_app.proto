@@ -1,0 +1,408 @@
+syntax = "proto3";
+
+package aptosbft.consensus.v1;
+
+option go_package = "github.com/dydxprotocol/v4-chain/protocol/app/consensusbridge";
+
+// ConsensusApp defines the gRPC service interface between AptosBFT consensus (Rust)
+// and the dYdX v4 application (Go/Cosmos SDK).
+//
+// This bridge enables AptosBFT to drive consensus while the dYdX app handles
+// state machine execution, order matching, and application-specific logic.
+service ConsensusApp {
+  // BuildBlock requests the application to construct a block proposal.
+  //
+  // Called by AptosBFT's proposer to:
+  // 1. Fetch pending transactions from mempool
+  // 2. Execute PrepareProposal logic (order matching for dYdX)
+  // 3. Return assembled block data
+  //
+  // This corresponds to ABCI++ PrepareProposal but is decoupled from
+  // the consensus socket interface for better performance.
+  rpc BuildBlock(BuildBlockRequest) returns (BuildBlockResponse);
+
+  // VerifyBlock requests the application to verify a proposed block.
+  //
+  // Called by AptosBFT's non-proposing validators to:
+  // 1. Validate block structure and semantics
+  // 2. Re-execute matching engine deterministically
+  // 3. Verify the proposer acted honestly
+  //
+  // This corresponds to ABCI++ ProcessProposal.
+  rpc VerifyBlock(VerifyBlockRequest) returns (VerifyBlockResponse);
+
+  // ExecuteBlock requests the application to execute a block's transactions.
+  //
+  // Called after a QuorumCertificate is formed to:
+  // 1. Execute all transactions in the block
+  // 2. Update application state
+  // 3. Compute new state root (app hash)
+  // 4. Return execution results for commitment
+  //
+  // This corresponds to ABCI++ FinalizeBlock's execution phase.
+  rpc ExecuteBlock(ExecuteBlockRequest) returns (ExecuteBlockResponse);
+
+  // GenerateVoteExtension requests application data to include in votes.
+  //
+  // Called by AptosBFT before voting to:
+  // 1. Fetch application-specific data (e.g., oracle prices)
+  // 2. Sign and return data for inclusion in Precommit votes
+  //
+  // For dYdX, this returns Slinky oracle price data via vote extensions.
+  rpc GenerateVoteExtension(VoteExtensionRequest) returns (VoteExtensionResponse);
+
+  // CommitBlock notifies the application that a block is committed.
+  //
+  // Called after execute_block succeeds and the block is finalized:
+  // 1. Persist state changes
+  // 2. Update committed block height
+  // 3. Trigger any post-commit hooks
+  //
+  // This corresponds to ABCI++ Commit.
+  rpc CommitBlock(CommitBlockRequest) returns (CommitBlockResponse);
+
+  // MempoolSync establishes a bidirectional stream for mempool synchronization.
+  //
+  // This streaming RPC enables:
+  // 1. Order streaming from Rust Quorum Store to Go application
+  // 2. Batch fetching of transactions on demand
+  // 3. Mempool gossip coordination between Rust and Go
+  //
+  // The stream is long-lived and supports both directions simultaneously.
+  rpc MempoolSync(stream MempoolRequest) returns (stream MempoolResponse);
+
+  // Query allows consensus to query application state.
+  //
+  // Used for lightweight queries without full block execution:
+  // 1. Validator set queries
+  // 2. Account balance checks
+  // 3. State proof generation
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+// ============================================================================
+// BuildBlock - Block Proposal
+// ============================================================================
+
+// BuildBlockRequest carries the parameters needed to construct a block proposal.
+message BuildBlockRequest {
+  // height is the block height being proposed
+  uint64 height = 1;
+
+  // round is the consensus round number
+  uint64 round = 2;
+
+  // timestamp is the proposed block timestamp (unix nanoseconds)
+  int64 timestamp = 3;
+
+  // proposer_address is the address of the block proposer
+  bytes proposer_address = 4;
+
+  // parent_hash is the hash of the parent block
+  bytes parent_hash = 5;
+
+  // max_bytes is the maximum block size in bytes
+  uint64 max_bytes = 6;
+
+  // max_gas is the maximum gas limit for the block
+  int64 max_gas = 7;
+
+  // pending_txs_count is a hint about available pending transactions
+  uint64 pending_txs_count = 8;
+}
+
+// BuildBlockResponse carries the constructed block proposal.
+message BuildBlockResponse {
+  // transactions is the list of transactions to include in the block
+  repeated bytes transactions = 1;
+
+  // extensions is application data to include in the proposal header
+  bytes extensions = 2;
+
+  // state_update_hint provides hints about expected state changes
+  StateUpdateHint state_update_hint = 3;
+}
+
+// StateUpdateHint provides metadata about expected state changes.
+message StateUpdateHint {
+  // expected_gas_used is the total gas expected to be consumed
+  uint64 expected_gas_used = 1;
+
+  // expected_size_bytes is the expected state delta size
+  uint64 expected_size_bytes = 2;
+}
+
+// ============================================================================
+// VerifyBlock - Block Verification
+// ============================================================================
+
+// VerifyBlockRequest carries a proposed block for verification.
+message VerifyBlockRequest {
+  // height is the block height being verified
+  uint64 height = 1;
+
+  // round is the consensus round number
+  uint64 round = 2;
+
+  // proposer_address is the address of the block proposer
+  bytes proposer_address = 3;
+
+  // parent_hash is the hash of the parent block
+  bytes parent_hash = 4;
+
+  // transactions is the list of transactions in the proposed block
+  repeated bytes transactions = 5;
+
+  // proposer_extensions is application data from the proposal
+  bytes proposer_extensions = 6;
+}
+
+// VerifyBlockResponse indicates the verification result.
+message VerifyBlockResponse {
+  // accepted indicates whether the block is valid
+  bool accepted = 1;
+
+  // reject_reason contains details if the block was rejected
+  string reject_reason = 2;
+
+  // gas_used is the gas consumed during verification
+  uint64 gas_used = 3;
+}
+
+// ============================================================================
+// ExecuteBlock - Block Execution
+// ============================================================================
+
+// ExecuteBlockRequest carries a block for execution after consensus agrees.
+message ExecuteBlockRequest {
+  // height is the block height being executed
+  uint64 height = 1;
+
+  // round is the consensus round number
+  uint64 round = 2;
+
+  // timestamp is the block timestamp (unix nanoseconds)
+  int64 timestamp = 3;
+
+  // proposer_address is the address of the block proposer
+  bytes proposer_address = 4;
+
+  // parent_hash is the hash of the parent block
+  bytes parent_hash = 5;
+
+  // parent_state_root is the merkle root of the parent state
+  bytes parent_state_root = 6;
+
+  // transactions is the list of transactions to execute
+  repeated bytes transactions = 7;
+
+  // aggregated_vote_extensions contains vote extensions aggregated from QC
+  bytes aggregated_vote_extensions = 8;
+}
+
+// ExecuteBlockResponse carries the execution results.
+message ExecuteBlockResponse {
+  // new_state_root is the merkle root of the new state
+  bytes new_state_root = 1;
+
+  // tx_results contains execution results for each transaction
+  repeated TxResult tx_results = 2;
+
+  // events contains application events emitted during execution
+  repeated Event events = 3;
+
+  // gas_used is the total gas consumed by execution
+  uint64 gas_used = 4;
+
+  // validator_updates contains any validator set changes
+  repeated ValidatorUpdate validator_updates = 5;
+}
+
+// TxResult represents the result of executing a single transaction.
+message TxResult {
+  // code is the result code (0 = success)
+  uint32 code = 1;
+
+  // data is the transaction result data
+  bytes data = 2;
+
+  // log contains human-readable logging info
+  string log = 3;
+
+  // info provides additional information
+  string info = 4;
+
+  // gas_used is the gas consumed by this transaction
+  uint64 gas_used = 5;
+
+  // events contains events emitted by this transaction
+  repeated Event events = 6;
+}
+
+// Event represents an application event.
+message Event {
+  // type is the event type
+  string type = 1;
+
+  // attributes is a list of key-value pairs
+  repeated EventAttribute attributes = 2;
+}
+
+// EventAttribute is a key-value pair in an event.
+message EventAttribute {
+  string key = 1;
+  bytes value = 2;
+  bool index = 3;
+}
+
+// ValidatorUpdate represents a validator set change.
+message ValidatorUpdate {
+  bytes public_key = 1;
+  int64 power = 2;
+}
+
+// ============================================================================
+// Vote Extensions
+// ============================================================================
+
+// VoteExtensionRequest carries the context for generating vote extensions.
+message VoteExtensionRequest {
+  // height is the block height for which to generate extensions
+  uint64 height = 1;
+
+  // round is the consensus round number
+  uint64 round = 2;
+
+  // block_hash is the hash of the block being voted on
+  bytes block_hash = 3;
+
+  // timestamp is the current timestamp (unix nanoseconds)
+  int64 timestamp = 4;
+}
+
+// VoteExtensionResponse carries the generated vote extension data.
+message VoteExtensionResponse {
+  // extension is the application data to include in the vote
+  bytes extension = 1;
+
+  // signature is the application's signature over the extension
+  bytes signature = 2;
+}
+
+// ============================================================================
+// CommitBlock - Block Commit
+// ============================================================================
+
+// CommitBlockRequest notifies the application of a committed block.
+message CommitBlockRequest {
+  // height is the committed block height
+  uint64 height = 1;
+
+  // block_hash is the hash of the committed block
+  bytes block_hash = 2;
+
+  // state_root is the merkle root of the committed state
+  bytes state_root = 3;
+
+  // retained_height is the height below which state can be pruned
+  uint64 retained_height = 4;
+}
+
+// CommitBlockResponse acknowledges the commit.
+message CommitBlockResponse {
+  // hash is a hash of the application state (for light client verification)
+  bytes hash = 1;
+
+  // prune_height is the height below which state can be pruned
+  uint64 prune_height = 2;
+}
+
+// ============================================================================
+// MempoolSync - Bidirectional Mempool Stream
+// ============================================================================
+
+// MempoolRequest is a message from the application to the consensus layer.
+message MempoolRequest {
+  oneof request {
+    // fetch_batch requests a batch of transactions from the mempool
+    FetchBatchRequest fetch_batch = 1;
+
+    // order_ready notifies the consensus layer that new orders are ready
+    OrderReadyNotification order_ready = 2;
+
+    // ack_batch acknowledges receipt of a batch
+    BatchAck ack_batch = 3;
+  }
+}
+
+// FetchBatchRequest requests transactions from the mempool.
+message FetchBatchRequest {
+  uint64 max_bytes = 1;
+  uint64 max_txs = 2;
+}
+
+// OrderReadyNotification signals that new orders are available.
+message OrderReadyNotification {
+  uint32 order_count = 1;
+  int64 timestamp = 2;
+}
+
+// BatchAck acknowledges successful processing of a batch.
+message BatchAck {
+  uint64 batch_id = 1;
+  bool accepted = 2;
+}
+
+// MempoolResponse is a message from the consensus layer to the application.
+message MempoolResponse {
+  oneof response {
+    // tx_batch delivers a batch of transactions
+    TxBatch tx_batch = 1;
+
+    // batch_request signals the consensus layer needs transactions
+    BatchRequest batch_request = 2;
+
+    // ack_response acknowledges an ack
+    AckResponse ack_response = 3;
+  }
+}
+
+// TxBatch delivers a batch of transactions.
+message TxBatch {
+  uint64 batch_id = 1;
+  repeated bytes transactions = 2;
+  bool is_final = 3;
+}
+
+// BatchRequest requests transactions from the application mempool.
+message BatchRequest {
+  uint64 max_bytes = 1;
+  uint64 max_txs = 2;
+  int64 deadline_ms = 3;
+}
+
+// AckResponse acknowledges a BatchAck.
+message AckResponse {
+  uint64 batch_id = 1;
+  bool accepted = 2;
+}
+
+// ============================================================================
+// Query - State Queries
+// ============================================================================
+
+// QueryRequest is a generic state query request.
+message QueryRequest {
+  bytes path = 1;
+  bytes data = 2;
+  int64 height = 3;
+  bool prove = 4;
+}
+
+// QueryResponse is the query response.
+message QueryResponse {
+  bytes value = 1;
+  bytes proof = 2;
+  int64 height = 3;
+  bytes log = 4;
+}

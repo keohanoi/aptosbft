@@ -1,0 +1,14 @@
+[package]
+name = "consensus-grpc-protos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC protocol definitions for AptosBFT consensus bridge"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

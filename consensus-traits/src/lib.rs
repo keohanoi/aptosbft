@@ -61,6 +61,7 @@ pub mod network;
 pub mod proposer;
 pub mod safety;
 pub mod storage;
+pub mod vote_extension;
 
 // Re-export commonly used traits at the crate root
 pub use block::{
@@ -77,6 +78,7 @@ pub use network::{ValidatorInfo, ValidatorSet};
 pub use proposer::{ProposerElection, ProposerInfo, ReputationTracker};
 pub use safety::{CommitDecision, SafetyRules, SafetyState, TimeoutCertificate};
 pub use storage::{ConsensusStorage, StateComputer, StateView};
+pub use vote_extension::{NoOpVoteExtensionGenerator, VoteExtensionGenerator};
 
 /// Result type alias for consensus operations.
 pub type Result<T> = std::result::Result<T, core::Error>;
