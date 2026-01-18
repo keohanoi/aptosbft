@@ -123,7 +123,11 @@ fn setup_runtime() -> Result<(ConsensusRuntime<MockBlock, MockVote, TestProposer
         .build()?;
 
     let runtime_config = RuntimeConfig::default();
-    let runtime = ConsensusRuntime::new(consensus, runtime_config);
+    let runtime = ConsensusRuntime::<MockBlock, MockVote, RoundRobinProposer<TestAuthor>, ()>::new(
+        consensus,
+        runtime_config,
+        None,
+    );
 
     // Create validators vector
     let validators = vec![

@@ -486,7 +486,11 @@ fn test_runtime_process_pending_messages() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     // Add various messages
     let block = Arc::new(MockBlock::genesis());
@@ -532,7 +536,11 @@ fn test_runtime_handle_network_message_proposal() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let block = Arc::new(MockBlock::genesis());
     let result = runtime.handle_network_message(NetworkMessage::Proposal { block });
@@ -554,7 +562,11 @@ fn test_runtime_handle_network_message_vote() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let vote = Arc::new(make_vote(0, 0, 1, MockHash(0)));
     let result = runtime.handle_network_message(NetworkMessage::Vote { vote });
@@ -579,7 +591,11 @@ fn test_runtime_handle_network_message_timeout() {
     // Start consensus to put it in Running state
     consensus.start().unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let result = runtime.handle_network_message(NetworkMessage::Timeout { round: 1 });
 
@@ -601,7 +617,11 @@ fn test_runtime_handle_network_message_sync_request() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let result = runtime.handle_network_message(NetworkMessage::SyncRequest { target_round: 5 });
 
@@ -622,7 +642,11 @@ fn test_runtime_handle_network_message_sync_response() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let blocks = vec![Arc::new(MockBlock::genesis())];
     let result = runtime.handle_network_message(NetworkMessage::SyncResponse { blocks });
@@ -644,7 +668,11 @@ fn test_runtime_execute_block() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let block = Arc::new(MockBlock::genesis());
     let result = runtime.execute_block(block);
@@ -666,7 +694,11 @@ fn test_runtime_broadcast_proposal() {
             .build()
             .unwrap();
 
-    let runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let proposal = Arc::new(MockBlock::genesis());
     let result = runtime.broadcast_proposal(proposal);
@@ -688,7 +720,11 @@ fn test_runtime_broadcast_vote() {
             .build()
             .unwrap();
 
-    let runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     let vote = Arc::new(make_vote(0, 0, 1, MockHash(0)));
     let result = runtime.broadcast_vote(vote);
@@ -710,7 +746,11 @@ fn test_runtime_shutdown_when_not_running() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     // Runtime not started
     let result = runtime.shutdown();
@@ -733,7 +773,11 @@ fn test_runtime_start_when_already_running() {
             .build()
             .unwrap();
 
-    let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+    let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+        consensus,
+        RuntimeConfig::default(),
+        None,
+    );
 
     runtime.start().unwrap();
 

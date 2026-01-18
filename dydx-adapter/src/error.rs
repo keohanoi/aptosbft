@@ -70,6 +70,36 @@ impl DydxAdapterError {
     pub fn msg(msg: impl Into<String>) -> Self {
         Self::Message(msg.into())
     }
+
+    /// Create a new connection error
+    pub fn connection(msg: impl Into<String>) -> Self {
+        Self::Connection(msg.into())
+    }
+}
+
+// Implement From conversions for common error types
+impl From<std::io::Error> for DydxAdapterError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Connection(err.to_string())
+    }
+}
+
+impl From<tokio::task::JoinError> for DydxAdapterError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        Self::Message(format!("Task join error: {}", err))
+    }
+}
+
+impl From<serde_json::Error> for DydxAdapterError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Message(format!("JSON error: {}", err))
+    }
+}
+
+impl From<anyhow::Error> for DydxAdapterError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Message(err.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 // Import for TmHash display
 use hex;
 
+// Import for gRPC queries (optional, only when grpc feature is enabled)
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 /// Tendermint Block header
 ///
 /// This mirrors the Tendermint BlockHeader structure defined in:
@@ -205,19 +209,148 @@ impl Default for HeaderBuilderConfig {
     }
 }
 
+/// Trait for querying validator information from the application
+///
+/// This trait allows the SyntheticHeaderBuilder to look up validator
+/// metadata when constructing IBC headers. Implementations can use
+/// gRPC queries, local state, or cached data.
+#[async_trait::async_trait]
+pub trait ValidatorRegistry: Send + Sync {
+    /// Query the full validator set at a given height
+    ///
+    /// # Arguments
+    /// * `height` - The block height to query (0 for latest)
+    ///
+    /// # Returns
+    /// * `Ok(ValidatorRegistryEntry)` - The validator registry entry
+    /// * `Err(DydxAdapterError)` - If the query fails
+    async fn query_validator_set(
+        &self,
+        height: u64,
+    ) -> Result<ValidatorRegistryEntry, DydxAdapterError>;
+
+    /// Query a single validator by index
+    ///
+    /// # Arguments
+    /// * `validator_index` - The validator's index in the set
+    /// * `height` - The block height to query (0 for latest)
+    ///
+    /// # Returns
+    /// * `Ok(ValidatorInfo)` - The validator information
+    /// * `Err(DydxAdapterError)` - If the validator is not found or query fails
+    async fn query_validator(
+        &self,
+        validator_index: usize,
+        height: u64,
+    ) -> Result<ValidatorInfo, DydxAdapterError>;
+}
+
+/// Validator registry entry containing the full validator set
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorRegistryEntry {
+    /// List of all validators
+    pub validators: Vec<ValidatorInfo>,
+
+    /// Total voting power
+    pub total_voting_power: u64,
+
+    /// Height of this validator set
+    pub height: u64,
+}
+
+/// Information about a single validator
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorInfo {
+    /// Validator index in the set
+    pub index: usize,
+
+    /// Consensus address (32 bytes for Ed25519 public key)
+    pub address: [u8; 32],
+
+    /// Voting power
+    pub voting_power: u64,
+
+    /// Proposer priority (optional)
+    pub proposer_priority: Option<i64>,
+}
+
+/// In-memory validator registry for testing and fallback scenarios
+#[derive(Clone, Debug)]
+pub struct InMemoryValidatorRegistry {
+    validators: Arc<RwLock<Vec<ValidatorInfo>>>,
+}
+
+impl InMemoryValidatorRegistry {
+    /// Create a new in-memory validator registry
+    pub fn new(validators: Vec<ValidatorInfo>) -> Self {
+        Self {
+            validators: Arc::new(RwLock::new(validators)),
+        }
+    }
+
+    /// Create an empty registry (returns placeholder validators)
+    pub fn empty() -> Self {
+        Self::new(vec![])
+    }
+}
+
+#[async_trait::async_trait]
+impl ValidatorRegistry for InMemoryValidatorRegistry {
+    async fn query_validator_set(
+        &self,
+        _height: u64,
+    ) -> Result<ValidatorRegistryEntry, DydxAdapterError> {
+        let validators = self.validators.read().await;
+        let total_voting_power = validators.iter().map(|v| v.voting_power).sum();
+
+        Ok(ValidatorRegistryEntry {
+            validators: validators.clone(),
+            total_voting_power,
+            height: _height,
+        })
+    }
+
+    async fn query_validator(
+        &self,
+        validator_index: usize,
+        _height: u64,
+    ) -> Result<ValidatorInfo, DydxAdapterError> {
+        let validators = self.validators.read().await;
+        validators
+            .get(validator_index)
+            .cloned()
+            .ok_or_else(|| DydxAdapterError::msg(format!("Validator not found at index {}", validator_index)))
+    }
+}
+
 /// Builder for creating synthetic Tendermint headers from AptosBFT QCs
 pub struct SyntheticHeaderBuilder {
     config: HeaderBuilderConfig,
+    validator_registry: Option<Arc<dyn ValidatorRegistry>>,
 }
 
 impl SyntheticHeaderBuilder {
-    /// Create a new header builder
+    /// Create a new header builder with validator registry support
     pub fn new(config: HeaderBuilderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            validator_registry: None,
+        }
+    }
+
+    /// Set the validator registry for looking up validator information
+    ///
+    /// This is required for generating accurate IBC headers with real validator sets.
+    /// Without a registry, the builder will use placeholder validators.
+    pub fn with_validator_registry(mut self, registry: Arc<dyn ValidatorRegistry>) -> Self {
+        self.validator_registry = Some(registry);
+        self
     }
 
     /// Create a header from a QuorumCertificate and ledger info
-    pub fn build_header_from_qc<QC, B>(
+    ///
+    /// This is an async method to support validator registry queries.
+    pub async fn build_header_from_qc<QC, B>(
         &self,
         qc: &QC,
         ledger_info: &DydxLedgerInfo,
@@ -250,7 +383,7 @@ impl SyntheticHeaderBuilder {
         let data_hash = TmHash(*block_data_hash);
 
         // Build validator set from QC signatures
-        let validators = self.extract_validators_from_qc(qc)?;
+        let validators = self.extract_validators_from_qc(qc).await?;
         let validators_hash = self.hash_validator_set(&validators);
 
         // Next validators hash: same as current when validator set hasn't changed
@@ -285,7 +418,7 @@ impl SyntheticHeaderBuilder {
     /// - A signers bitmask (each bit represents a validator index)
     /// - Total voting power of all validators
     /// - Voting power of the signers
-    fn extract_validators_from_qc<QC>(&self, qc: &QC) -> Result<ValidatorSet, DydxAdapterError>
+    async fn extract_validators_from_qc<QC>(&self, qc: &QC) -> Result<ValidatorSet, DydxAdapterError>
     where
         QC: QuorumCertificate,
     {
@@ -299,7 +432,7 @@ impl SyntheticHeaderBuilder {
         if let Some(dydx_qc) = qc_any.downcast_ref::<crate::types::DydxQuorumCert>() {
             // Extract validator set from DydxQuorumCert
             // The signers bitmask indicates which validators signed
-            return self.extract_validators_from_dydx_qc(dydx_qc);
+            return self.extract_validators_from_dydx_qc(dydx_qc).await;
         }
 
         // Fallback for non-dYdX QC types: return minimal validator set
@@ -326,42 +459,23 @@ impl SyntheticHeaderBuilder {
     /// This method parses the signers bitmask and builds the Tendermint-compatible
     /// validator set for IBC headers. It requires access to the validator registry
     /// to look up validator addresses by index.
-    fn extract_validators_from_dydx_qc(
+    async fn extract_validators_from_dydx_qc(
         &self,
-        _qc: &crate::types::DydxQuorumCert,
+        qc: &crate::types::DydxQuorumCert,
     ) -> Result<ValidatorSet, DydxAdapterError> {
-        // NOTE: This is a simplified implementation that demonstrates the structure.
-        // For production, you need to:
+        // If we have a validator registry, use it to look up real validators
+        if let Some(registry) = &self.validator_registry {
+            return self.extract_validators_with_registry(qc, registry).await;
+        }
 
-        // 1. Parse the signers bitmask to identify which validator indices signed
-        //    - Each bit in the signers Vec<u8> represents a validator
-        //    - Bit i is set if validator at index i signed the QC
+        // Fallback: Log warning and return minimal validator set
+        // This allows the system to continue during testing/deployment
+        log::warn!(
+            "No validator registry configured for IBC header generation at height {}. \
+            Returning minimal validator set. Configure a registry for production use.",
+            qc.certified_block.round()
+        );
 
-        // 2. Look up validator metadata from the validator registry
-        //    - Validator addresses (consensus keys)
-        //    - Voting power for each validator
-        //    - Proposer priority
-
-        // 3. Build the Tendermint ValidatorSet with only the signing validators
-        //    - This is required for IBC commit verification
-
-        // For now, we return a placeholder that indicates the structure
-        // In production, this would be:
-        // let mut validators = vec![];
-        // let mut total_power = 0;
-        // for (idx, validator) in validator_registry.iter().enumerate() {
-        //     if qc.is_signer(idx) {
-        //         validators.push(Validator {
-        //             address: validator.address,
-        //             power: validator.voting_power,
-        //             proposer_priority: Some(validator.proposer_priority),
-        //         });
-        //         total_power += validator.voting_power;
-        //     }
-        // }
-        // Ok(ValidatorSet { validators, total_voting_power: total_power })
-
-        // Placeholder: return minimal validator set
         let validators = vec![
             Validator {
                 address: Address([0u8; 32]),
@@ -373,6 +487,54 @@ impl SyntheticHeaderBuilder {
         Ok(ValidatorSet {
             validators,
             total_voting_power: 1000,
+        })
+    }
+
+    /// Extract validators using the validator registry
+    ///
+    /// This is the production implementation that:
+    /// 1. Parses the signers bitmask to identify which validator indices signed
+    /// 2. Looks up validator metadata from the validator registry
+    /// 3. Builds the Tendermint ValidatorSet with only the signing validators
+    async fn extract_validators_with_registry(
+        &self,
+        qc: &crate::types::DydxQuorumCert,
+        registry: &Arc<dyn ValidatorRegistry>,
+    ) -> Result<ValidatorSet, DydxAdapterError> {
+        let mut validators = vec![];
+        let mut total_power = 0u64;
+
+        // Query the full validator set at this height
+        let height = qc.certified_block.round();
+        let registry_entry = registry.query_validator_set(height).await?;
+
+        // Parse the signers bitmask to identify which validators signed
+        // Each bit in the signers Vec<u8> represents a validator
+        for (idx, validator_info) in registry_entry.validators.iter().enumerate() {
+            if qc.is_signer(idx) {
+                validators.push(Validator {
+                    address: Address(validator_info.address),
+                    power: validator_info.voting_power,
+                    proposer_priority: validator_info.proposer_priority.map(|p| p as u64),
+                });
+                total_power += validator_info.voting_power;
+            }
+        }
+
+        // Verify we found at least some signers
+        if validators.is_empty() {
+            log::warn!(
+                "No validators found in signers bitmask at height {}. \
+                Signers bitmask length: {}, Total validators: {}",
+                height,
+                qc.signers.len(),
+                registry_entry.validators.len()
+            );
+        }
+
+        Ok(ValidatorSet {
+            validators,
+            total_voting_power: total_power,
         })
     }
 
@@ -512,8 +674,8 @@ mod tests {
         assert_eq!(timestamp.nanos, 500_000_000);
     }
 
-    #[test]
-    fn test_build_header_from_qc() {
+    #[tokio::test]
+    async fn test_build_header_from_qc() {
         let builder = create_header_builder();
         let qc = MockQc;
 
@@ -535,7 +697,7 @@ mod tests {
             &qc,
             &ledger_info,
             &block_data_hash,
-        );
+        ).await;
 
         assert!(result.is_ok());
         let header = result.unwrap();
@@ -544,8 +706,8 @@ mod tests {
         assert_eq!(header.app_hash.0, ledger_info.accumulated_state.0);
     }
 
-    #[test]
-    fn test_serialize_header() {
+    #[tokio::test]
+    async fn test_serialize_header() {
         let builder = create_header_builder();
         let qc = MockQc;
 
@@ -567,7 +729,7 @@ mod tests {
             &qc,
             &ledger_info,
             &block_data_hash,
-        ).unwrap();
+        ).await.unwrap();
 
         let serialized = builder.serialize_header(&header);
         assert!(serialized.is_ok());
@@ -617,8 +779,8 @@ mod tests {
 
     // ========== Header Field Validation Tests ========== //
 
-    #[test]
-    fn test_header_height_must_be_positive() {
+    #[tokio::test]
+    async fn test_header_height_must_be_positive() {
         let builder = create_header_builder();
         let qc = MockQc;
         let ledger_info = create_mock_ledger_info(1 /* height */, 5 /* round */, 12345 /* timestamp */);
@@ -627,15 +789,15 @@ mod tests {
             &qc,
             &ledger_info,
             &[3u8; 32], // block_data_hash
-        );
+        ).await;
 
         assert!(result.is_ok());
         let header = result.unwrap();
         assert_eq!(header.height, 1);
     }
 
-    #[test]
-    fn test_header_chain_id_linkage() {
+    #[tokio::test]
+    async fn test_header_chain_id_linkage() {
         let builder = create_header_builder();
 
         // Create a chain of headers
@@ -652,7 +814,7 @@ mod tests {
                 &qc,
                 &ledger_info,
                 &block_data_hash,
-            );
+            ).await;
 
             assert!(result.is_ok());
             let header = result.unwrap();
@@ -668,8 +830,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_header_timestamp_monotonic() {
+    #[tokio::test]
+    async fn test_header_timestamp_monotonic() {
         let builder = create_header_builder();
 
         // Timestamp should be monotonically increasing
@@ -682,17 +844,17 @@ mod tests {
             &MockQc,
             &create_mock_ledger_info(0, 0, time1),
             &[42u8; 32],
-        ).unwrap();
+        ).await.unwrap();
         let header2 = builder.build_header_from_qc::<MockQc, crate::types::DydxBlock>(
             &MockQc,
             &create_mock_ledger_info(0, 0, time2),
             &[43u8; 32],
-        ).unwrap();
+        ).await.unwrap();
         let header3 = builder.build_header_from_qc::<MockQc, crate::types::DydxBlock>(
             &MockQc,
             &create_mock_ledger_info(0, 0, time3),
             &[44u8; 32],
-        ).unwrap();
+        ).await.unwrap();
 
         // Verify timestamps are monotonically increasing (time field is Timestamp)
         // Convert to seconds for comparison
@@ -705,8 +867,8 @@ mod tests {
         assert_eq!(header3.height, 1);
     }
 
-    #[test]
-    fn test_header_chain_verification() {
+    #[tokio::test]
+    async fn test_header_chain_verification() {
         // This test verifies that headers can be created successfully
         let builder = create_header_builder();
 
@@ -717,7 +879,7 @@ mod tests {
                 &MockQc,
                 &create_mock_ledger_info(0, i, 12345 + (i * 1000)),
                 &block_data_hash,
-            ).unwrap();
+            ).await.unwrap();
 
             // All headers have the same parent_id from MockQc ([0;32])
             assert_eq!(header.last_block_id.0, [0u8; 32]);
@@ -891,8 +1053,8 @@ mod tests {
         assert_eq!(commit.signatures[0].signature.0, [0u8; 64]);
     }
 
-    #[test]
-    fn test_build_header_with_genesis_height() {
+    #[tokio::test]
+    async fn test_build_header_with_genesis_height() {
         let builder = create_header_builder();
 
         // Test with height 0 (genesis block)
@@ -900,7 +1062,7 @@ mod tests {
             &MockQc,
             &create_mock_ledger_info(0, 0, 0),
             &[42u8; 32], // block_data_hash
-        );
+        ).await;
 
         assert!(result.is_ok());
         let header = result.unwrap();
@@ -909,8 +1071,8 @@ mod tests {
         assert_eq!(header.height, 1);
     }
 
-    #[test]
-    fn test_build_header_with_current_timestamp() {
+    #[tokio::test]
+    async fn test_build_header_with_current_timestamp() {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -923,7 +1085,7 @@ mod tests {
             &MockQc,
             &create_mock_ledger_info(0, 0, now_ms),
             &[42u8; 32],
-        );
+        ).await;
 
         // Should be valid - timestamp can be current or newer
         assert!(result.is_ok());
@@ -1007,8 +1169,8 @@ mod tests {
         assert_eq!(hash1.0, hash2.0);
     }
 
-    #[test]
-    fn test_serialize_deserialize_header_roundtrip() {
+    #[tokio::test]
+    async fn test_serialize_deserialize_header_roundtrip() {
         let builder = create_header_builder();
         let ledger_info = create_mock_ledger_info(10 /* epoch */, 5 /* round */, 15000 /* timestamp */);
         let block_data_hash = [42u8; 32];
@@ -1017,7 +1179,7 @@ mod tests {
             &MockQc,
             &ledger_info,
             &block_data_hash,
-        ).unwrap();
+        ).await.unwrap();
 
         // Serialize the header
         let serialized = builder.serialize_header(&header);
@@ -1035,8 +1197,8 @@ mod tests {
         assert_eq!(serialized_bytes, serialized2);
     }
 
-    #[test]
-    fn test_serialize_empty_header() {
+    #[tokio::test]
+    async fn test_serialize_empty_header() {
         let builder = create_header_builder();
         let ledger_info = create_mock_ledger_info(10 /* epoch */, 5 /* round */, 15000 /* timestamp */);
         let block_data_hash = [42u8; 32];
@@ -1045,7 +1207,7 @@ mod tests {
             &MockQc,
             &ledger_info,
             &block_data_hash,
-        ).unwrap();
+        ).await.unwrap();
 
         // Serialize and deserialize header
         let serialized = builder.serialize_header(&header);
@@ -1055,8 +1217,8 @@ mod tests {
         assert_eq!(deserialized.height, 1); // From MockQc.round()
     }
 
-    #[test]
-    fn test_header_consistency_checks() {
+    #[tokio::test]
+    async fn test_header_consistency_checks() {
         let builder = create_header_builder();
 
         // Create a header
@@ -1067,7 +1229,7 @@ mod tests {
             &MockQc,
             &ledger_info,
             &block_data_hash,
-        ).unwrap();
+        ).await.unwrap();
 
         // Verify the header has the parent hash from MockQc
         assert_eq!(header.last_block_id.0, [0u8; 32]);

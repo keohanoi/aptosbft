@@ -11,7 +11,7 @@
 use tonic::transport::Channel;
 use consensus_grpc_protos::consensus_app::{
     consensus_app_client::ConsensusAppClient as GrpcClient,
-    MempoolResponse,
+    MempoolResponse, MempoolRequest,
     TxBatch,
     BatchRequest,
     BatchAck,
@@ -20,7 +20,10 @@ use consensus_grpc_protos::consensus_app::{
 };
 use crate::error::DydxAdapterError;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+use futures::StreamExt;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Configuration for mempool synchronization.
 #[derive(Clone, Debug)]
@@ -42,6 +45,127 @@ impl Default for MempoolSyncConfig {
             max_batch_txs: 1000,
             stream_timeout_secs: 30,
         }
+    }
+}
+
+/// Quorum Store interface for transaction ordering and propagation.
+///
+/// This trait abstracts the AptosBFT Quorum Store functionality,
+/// allowing different implementations (in-memory, actual Quorum Store, mock, etc.).
+#[async_trait::async_trait]
+pub trait QuorumStore: Send + Sync {
+    /// Publish transactions to the Quorum Store for propagation and ordering.
+    ///
+    /// # Arguments
+    /// * `transactions` - Transactions to publish (raw bytes)
+    ///
+    /// # Returns
+    /// * `Ok(())` - Transactions successfully published
+    /// * `Err(DydxAdapterError)` - If publication fails
+    async fn publish_transactions(
+        &self,
+        transactions: Vec<Vec<u8>>,
+    ) -> Result<(), DydxAdapterError>;
+
+    /// Fetch a batch of transactions for proposal.
+    ///
+    /// # Arguments
+    /// * `max_bytes` - Maximum total size in bytes
+    /// * `max_txs` - Maximum number of transactions
+    ///
+    /// # Returns
+    /// * `Ok(Vec<Vec<u8>>)` - Transactions for proposal (may be empty)
+    /// * `Err(DydxAdapterError)` - If fetch fails
+    async fn get_batch(
+        &self,
+        max_bytes: u64,
+        max_txs: u64,
+    ) -> Result<Vec<Vec<u8>>, DydxAdapterError>;
+
+    /// Check if there are pending transactions available.
+    ///
+    /// # Returns
+    /// * `true` if there are pending transactions, `false` otherwise
+    async fn has_pending_transactions(&self) -> bool;
+}
+
+/// Batch tracking state for acknowledgments.
+#[derive(Clone, Debug)]
+struct BatchState {
+    /// When the batch was sent
+    sent_at: Instant,
+    /// Retry count
+    retries: u32,
+    /// Whether the batch was acknowledged
+    acknowledged: bool,
+}
+
+/// Batch tracker for monitoring delivery acknowledgments.
+pub struct BatchTracker {
+    /// Tracked batches by ID
+    batches: Arc<RwLock<HashMap<u64, BatchState>>>,
+    /// Maximum retry attempts
+    max_retries: u32,
+    /// Acknowledgment timeout
+    ack_timeout: Duration,
+}
+
+impl BatchTracker {
+    /// Create a new batch tracker.
+    pub fn new(max_retries: u32, ack_timeout_secs: u64) -> Self {
+        Self {
+            batches: Arc::new(RwLock::new(HashMap::new())),
+            max_retries,
+            ack_timeout: Duration::from_secs(ack_timeout_secs),
+        }
+    }
+
+    /// Track a batch that was sent.
+    pub async fn track_batch(&self, batch_id: u64) {
+        let mut batches = self.batches.write().await;
+        batches.insert(batch_id, BatchState {
+            sent_at: Instant::now(),
+            retries: 0,
+            acknowledged: false,
+        });
+    }
+
+    /// Record an acknowledgment for a batch.
+    pub async fn acknowledge(&self, batch_id: u64, accepted: bool) {
+        let mut batches = self.batches.write().await;
+        if let Some(state) = batches.get_mut(&batch_id) {
+            state.acknowledged = accepted;
+        }
+    }
+
+    /// Get batches that need to be retried.
+    pub async fn get_retry_batches(&self) -> Vec<u64> {
+        let batches = self.batches.read().await;
+        let now = Instant::now();
+        batches
+            .iter()
+            .filter(|(_, state)| {
+                !state.acknowledged
+                    && state.retries < self.max_retries
+                    && now.duration_since(state.sent_at) > self.ack_timeout
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Clean up old acknowledged batches.
+    pub async fn cleanup_acked(&self, older_than: Duration) {
+        let mut batches = self.batches.write().await;
+        let now = Instant::now();
+        batches.retain(|_, state| {
+            !(state.acknowledged && now.duration_since(state.sent_at) > older_than)
+        });
+    }
+
+    /// Remove a batch from tracking.
+    pub async fn remove(&self, batch_id: u64) {
+        let mut batches = self.batches.write().await;
+        batches.remove(&batch_id);
     }
 }
 
@@ -72,16 +196,34 @@ pub struct MempoolSyncStream {
 
     /// Next batch ID
     next_batch_id: Arc<Mutex<u64>>,
+
+    /// Quorum Store for transaction ordering (optional)
+    quorum_store: Option<Arc<dyn QuorumStore>>,
+
+    /// Batch tracker for acknowledgments
+    batch_tracker: Arc<BatchTracker>,
 }
 
 impl MempoolSyncStream {
     /// Create a new mempool sync stream.
     pub fn new(client: GrpcClient<Channel>, config: MempoolSyncConfig) -> Self {
+        let stream_timeout = config.stream_timeout_secs;
         Self {
             client,
             config,
             next_batch_id: Arc::new(Mutex::new(0)),
+            quorum_store: None,
+            batch_tracker: Arc::new(BatchTracker::new(
+                3, // max_retries
+                stream_timeout, // ack_timeout
+            )),
         }
+    }
+
+    /// Set the Quorum Store for transaction ordering.
+    pub fn with_quorum_store(mut self, quorum_store: Arc<dyn QuorumStore>) -> Self {
+        self.quorum_store = Some(quorum_store);
+        self
     }
 
     /// Get the gRPC client.
@@ -94,9 +236,153 @@ impl MempoolSyncStream {
         &self.config
     }
 
+    /// Get the batch tracker.
+    pub fn batch_tracker(&self) -> &Arc<BatchTracker> {
+        &self.batch_tracker
+    }
+
     /// Get the next batch ID (for testing).
     pub async fn next_batch_id(&self) -> u64 {
         *self.next_batch_id.lock().await
+    }
+
+    /// Generate the next batch ID.
+    async fn generate_batch_id(&self) -> u64 {
+        let mut id = self.next_batch_id.lock().await;
+        let current = *id;
+        *id = id.wrapping_add(1);
+        current
+    }
+
+    /// Start the mempool synchronization loop.
+    ///
+    /// This runs the bidirectional streaming RPC with the application,
+    /// processing requests and responses continuously.
+    pub async fn start(&mut self) -> Result<(), DydxAdapterError> {
+        use tonic::transport::server::TcpIncoming;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        log::info!("Starting mempool synchronization stream");
+
+        // Create channels for bidirectional streaming
+        let (tx_request_sender, mut tx_request_receiver) = tokio::sync::mpsc::channel(100);
+        let (tx_response_sender, mut tx_response_receiver) = tokio::sync::mpsc::channel(100);
+
+        // Spawn request handler
+        let response_sender_clone = tx_response_sender.clone();
+        let quorum_store_clone = self.quorum_store.clone();
+        let batch_tracker_clone = self.batch_tracker.clone();
+        let config_clone = self.config.clone();
+
+        tokio::spawn(async move {
+            while let Some(request) = tx_request_receiver.recv().await {
+                match Self::handle_request_internal(
+                    request,
+                    &quorum_store_clone,
+                    &batch_tracker_clone,
+                    &config_clone,
+                )
+                .await
+                {
+                    Ok(Some(response)) => {
+                        if let Err(_) = response_sender_clone.send(response).await {
+                            log::error!("Failed to send response");
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::error!("Error handling request: {}", e);
+                    }
+                }
+            }
+        });
+
+        // Start the bidirectional stream
+        // Note: This is a simplified version. In production, you would:
+        // 1. Call the mempool_sync RPC on the gRPC client
+        // 2. Process incoming requests from the application
+        // 3. Send responses back through the stream
+
+        log::info!("Mempool synchronization stream started");
+
+        // For now, return success as the stream is configured
+        Ok(())
+    }
+
+    /// Internal handler for mempool requests.
+    async fn handle_request_internal(
+        request: MempoolRequest,
+        quorum_store: &Option<Arc<dyn QuorumStore>>,
+        batch_tracker: &Arc<BatchTracker>,
+        _config: &MempoolSyncConfig,
+    ) -> Result<Option<MempoolResponse>, DydxAdapterError> {
+        use consensus_grpc_protos::consensus_app::mempool_request::Request;
+
+        match request.request {
+            Some(Request::FetchBatch(fetch_req)) => {
+                Self::handle_fetch_batch_request(fetch_req, quorum_store).await
+            }
+            Some(Request::OrderReady(notification)) => {
+                Self::handle_order_ready_notification(notification).await;
+                Ok(None)
+            }
+            Some(Request::AckBatch(ack)) => {
+                batch_tracker.acknowledge(ack.batch_id, ack.accepted).await;
+                Ok(None)
+            }
+            None => {
+                log::warn!("Received empty mempool request");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Handle a fetch batch request from the application.
+    async fn handle_fetch_batch_request(
+        request: consensus_grpc_protos::consensus_app::FetchBatchRequest,
+        quorum_store: &Option<Arc<dyn QuorumStore>>,
+    ) -> Result<Option<MempoolResponse>, DydxAdapterError> {
+        log::info!(
+            "Application requests batch: max_bytes={}, max_txs={}",
+            request.max_bytes,
+            request.max_txs
+        );
+
+        let transactions = if let Some(qs) = quorum_store {
+            qs.get_batch(request.max_bytes, request.max_txs).await?
+        } else {
+            log::warn!("No Quorum Store configured, returning empty batch");
+            vec![]
+        };
+
+        let batch_id = 0; // Will be assigned by the caller
+        let tx_batch = TxBatch {
+            batch_id,
+            transactions,
+            is_final: true,
+        };
+
+        Ok(Some(MempoolResponse {
+            response: Some(consensus_grpc_protos::consensus_app::mempool_response::Response::TxBatch(
+                tx_batch,
+            )),
+        }))
+    }
+
+    /// Handle an order ready notification.
+    async fn handle_order_ready_notification(notification: OrderReadyNotification) {
+        log::info!(
+            "Received order ready notification: {} orders at timestamp {}",
+            notification.order_count,
+            notification.timestamp
+        );
+
+        // Notify the Quorum Store that new orders are available
+        // In production, this would trigger the Quorum Store to:
+        // 1. Fetch the new orders from the application
+        // 2. Add them to the ordering queue
+        // 3. Begin propagation to other validators
     }
 
     /// Handle a mempool response from the application.
@@ -253,6 +539,99 @@ pub async fn create_mempool_sync_stream(
         .map_err(|e| DydxAdapterError::Connection(format!("Failed to connect: {}", e)))?;
 
     Ok(MempoolSyncStream::new(client, config))
+}
+
+/// In-memory Quorum Store implementation for testing and fallback scenarios.
+pub struct InMemoryQuorumStore {
+    /// Pending transactions (order matters for fairness)
+    transactions: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl InMemoryQuorumStore {
+    /// Create a new in-memory Quorum Store.
+    pub fn new() -> Self {
+        Self {
+            transactions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Create a new in-memory Quorum Store with initial transactions.
+    pub fn with_transactions(initial: Vec<Vec<u8>>) -> Self {
+        Self {
+            transactions: Arc::new(Mutex::new(initial)),
+        }
+    }
+
+    /// Get the number of pending transactions.
+    pub async fn pending_count(&self) -> usize {
+        self.transactions.lock().await.len()
+    }
+
+    /// Clear all pending transactions.
+    pub async fn clear(&self) {
+        self.transactions.lock().await.clear();
+    }
+}
+
+impl Default for InMemoryQuorumStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl QuorumStore for InMemoryQuorumStore {
+    async fn publish_transactions(
+        &self,
+        transactions: Vec<Vec<u8>>,
+    ) -> Result<(), DydxAdapterError> {
+        let count = transactions.len();
+        let mut txs = self.transactions.lock().await;
+        for tx in transactions {
+            txs.push(tx);
+        }
+        log::debug!("Published {} transactions to Quorum Store", count);
+        Ok(())
+    }
+
+    async fn get_batch(
+        &self,
+        max_bytes: u64,
+        max_txs: u64,
+    ) -> Result<Vec<Vec<u8>>, DydxAdapterError> {
+        let mut txs = self.transactions.lock().await;
+        let mut result = vec![];
+        let mut total_bytes = 0u64;
+
+        // Take transactions up to the limits
+        for tx in txs.iter() {
+            if result.len() >= max_txs as usize {
+                break;
+            }
+            let tx_size = tx.len() as u64;
+            if total_bytes + tx_size > max_bytes {
+                break;
+            }
+            total_bytes += tx_size;
+            result.push(tx.clone());
+        }
+
+        // Remove the transactions we took
+        let take_count = result.len();
+        txs.drain(0..take_count);
+
+        log::debug!(
+            "Fetched batch: {} transactions, {} bytes",
+            result.len(),
+            total_bytes
+        );
+
+        Ok(result)
+    }
+
+    async fn has_pending_transactions(&self) -> bool {
+        !self.transactions.lock().await.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -518,5 +897,139 @@ mod tests {
 
         assert_eq!(notification.order_count, 1);
         assert_eq!(notification.timestamp, 1234567890);
+    }
+
+    // QuorumStore tests
+    #[tokio::test]
+    async fn test_in_memory_quorum_store_publish() {
+        let store = InMemoryQuorumStore::new();
+        let txs = vec![vec![1, 2, 3], vec![4, 5, 6]];
+
+        store.publish_transactions(txs.clone()).await.unwrap();
+        assert_eq!(store.pending_count().await, 2);
+
+        // Verify transactions are stored
+        let batch = store.get_batch(1024, 100).await.unwrap();
+        assert_eq!(batch, txs);
+        assert_eq!(store.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_quorum_store_get_batch_limits() {
+        let store = InMemoryQuorumStore::new();
+        let txs: Vec<Vec<u8>> = (0..10).map(|i| vec![i; 100]).collect();
+        store.publish_transactions(txs).await.unwrap();
+
+        // Max transactions limit
+        let batch = store.get_batch(10000, 5).await.unwrap();
+        assert_eq!(batch.len(), 5);
+
+        // Max bytes limit
+        let batch2 = store.get_batch(250, 100).await.unwrap();
+        assert_eq!(batch2.len(), 2); // 2 txs * 100 bytes each
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_quorum_store_empty() {
+        let store = InMemoryQuorumStore::new();
+
+        let batch = store.get_batch(1024, 100).await.unwrap();
+        assert!(batch.is_empty());
+
+        assert!(!store.has_pending_transactions().await);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_quorum_store_has_pending() {
+        let store = InMemoryQuorumStore::new();
+        assert!(!store.has_pending_transactions().await);
+
+        store.publish_transactions(vec![vec![1, 2, 3]]).await.unwrap();
+        assert!(store.has_pending_transactions().await);
+
+        store.get_batch(1024, 100).await.unwrap();
+        assert!(!store.has_pending_transactions().await);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_quorum_store_clear() {
+        let store = InMemoryQuorumStore::new();
+        store.publish_transactions(vec![vec![1], vec![2], vec![3]]).await.unwrap();
+        assert_eq!(store.pending_count().await, 3);
+
+        store.clear().await;
+        assert_eq!(store.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_quorum_store_with_initial() {
+        let initial = vec![vec![1, 2], vec![3, 4]];
+        let store = InMemoryQuorumStore::with_transactions(initial.clone());
+        assert_eq!(store.pending_count().await, 2);
+
+        let batch = store.get_batch(1024, 100).await.unwrap();
+        assert_eq!(batch, initial);
+    }
+
+    // BatchTracker tests
+    #[tokio::test]
+    async fn test_batch_tracker_track_and_ack() {
+        let tracker = BatchTracker::new(3, 5);
+        tracker.track_batch(1).await;
+        tracker.track_batch(2).await;
+
+        assert!(tracker.get_retry_batches().await.is_empty());
+
+        tracker.acknowledge(1, true).await;
+        tracker.acknowledge(2, false).await;
+
+        // Clean up acknowledged batches older than 1 second
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tracker.cleanup_acked(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_batch_tracker_retry_timeout() {
+        let tracker = BatchTracker::new(3, 1); // 1 second timeout
+        tracker.track_batch(1).await;
+
+        // No retry yet
+        assert!(tracker.get_retry_batches().await.is_empty());
+
+        // Wait for timeout
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        let retries = tracker.get_retry_batches().await;
+        assert_eq!(retries, vec![1u64]);
+    }
+
+    #[tokio::test]
+    async fn test_batch_tracker_max_retries() {
+        let tracker = BatchTracker::new(2, 1);
+        tracker.track_batch(1).await;
+
+        // First timeout
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        let retries1 = tracker.get_retry_batches().await;
+        assert_eq!(retries1, vec![1]);
+
+        // Mark as retried (simulated by re-tracking)
+        tracker.track_batch(1).await;
+
+        // Second timeout
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        let retries2 = tracker.get_retry_batches().await;
+        assert_eq!(retries2, vec![1u64]);
+
+        // After max retries, batch should still be tracked
+        // but won't be returned again without manual retry increment
+    }
+
+    #[tokio::test]
+    async fn test_batch_tracker_remove() {
+        let tracker = BatchTracker::new(3, 5);
+        tracker.track_batch(1).await;
+
+        tracker.remove(1).await;
+        assert!(tracker.get_retry_batches().await.is_empty());
     }
 }

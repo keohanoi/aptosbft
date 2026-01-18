@@ -1,0 +1,188 @@
+# dYdX AptosBFT Consensus Node - Docker Compose
+#
+# This docker-compose file sets up a local testnet with 4 validator nodes
+# running the dYdX AptosBFT consensus.
+
+version: '3.8'
+
+services:
+  # Validator 1
+  validator1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: dydx-validator1
+    hostname: validator1
+    ports:
+      - "50052:50052"  # gRPC
+      - "9001:9001"    # P2P
+      - "9090:9090"    # Metrics
+    environment:
+      - DYDX_GRPC_BIND_ADDRESS=0.0.0.0:50052
+      - DYDX_P2P_LISTEN_ADDRESS=0.0.0.0:9001
+      - DYDX_PEERS=validator2:9002,validator3:9003,validator4:9004
+      - DYDX_METRICS_BIND_ADDRESS=0.0.0.0:9090
+      - DYDX_LOG_LEVEL=debug
+      - DYDX_DATA_DIR=/var/lib/dydxaptosbft
+    volumes:
+      - validator1-data:/var/lib/dydxaptosbft
+      - ./config/validator1:/etc/dydxaptosbft
+    networks:
+      - dydx-testnet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Validator 2
+  validator2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: dydx-validator2
+    hostname: validator2
+    ports:
+      - "50053:50052"  # gRPC
+      - "9002:9002"    # P2P
+      - "9091:9090"    # Metrics
+    environment:
+      - DYDX_GRPC_BIND_ADDRESS=0.0.0.0:50052
+      - DYDX_P2P_LISTEN_ADDRESS=0.0.0.0:9002
+      - DYDX_PEERS=validator1:9001,validator3:9003,validator4:9004
+      - DYDX_METRICS_BIND_ADDRESS=0.0.0.0:9090
+      - DYDX_LOG_LEVEL=debug
+      - DYDX_DATA_DIR=/var/lib/dydxaptosbft
+    volumes:
+      - validator2-data:/var/lib/dydxaptosbft
+      - ./config/validator2:/etc/dydxaptosbft
+    networks:
+      - dydx-testnet
+    restart: unless-stopped
+    depends_on:
+      - validator1
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Validator 3
+  validator3:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: dydx-validator3
+    hostname: validator3
+    ports:
+      - "50054:50052"  # gRPC
+      - "9003:9003"    # P2P
+      - "9092:9090"    # Metrics
+    environment:
+      - DYDX_GRPC_BIND_ADDRESS=0.0.0.0:50052
+      - DYDX_P2P_LISTEN_ADDRESS=0.0.0.0:9003
+      - DYDX_PEERS=validator1:9001,validator2:9002,validator4:9004
+      - DYDX_METRICS_BIND_ADDRESS=0.0.0.0:9090
+      - DYDX_LOG_LEVEL=debug
+      - DYDX_DATA_DIR=/var/lib/dydxaptosbft
+    volumes:
+      - validator3-data:/var/lib/dydxaptosbft
+      - ./config/validator3:/etc/dydxaptosbft
+    networks:
+      - dydx-testnet
+    restart: unless-stopped
+    depends_on:
+      - validator1
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Validator 4
+  validator4:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: dydx-validator4
+    hostname: validator4
+    ports:
+      - "50055:50052"  # gRPC
+      - "9004:9004"    # P2P
+      - "9093:9090"    # Metrics
+    environment:
+      - DYDX_GRPC_BIND_ADDRESS=0.0.0.0:50052
+      - DYDX_P2P_LISTEN_ADDRESS=0.0.0.0:9004
+      - DYDX_PEERS=validator1:9001,validator2:9002,validator3:9003
+      - DYDX_METRICS_BIND_ADDRESS=0.0.0.0:9090
+      - DYDX_LOG_LEVEL=debug
+      - DYDX_DATA_DIR=/var/lib/dydxaptosbft
+    volumes:
+      - validator4-data:/var/lib/dydxaptosbft
+      - ./config/validator4:/etc/dydxaptosbft
+    networks:
+      - dydx-testnet
+    restart: unless-stopped
+    depends_on:
+      - validator1
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Prometheus (optional - for metrics monitoring)
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: dydx-prometheus
+    ports:
+      - "9094:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - dydx-testnet
+    restart: unless-stopped
+
+  # Grafana (optional - for metrics visualization)
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: dydx-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - dydx-testnet
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+networks:
+  dydx-testnet:
+    driver: bridge
+
+volumes:
+  validator1-data:
+  validator2-data:
+  validator3-data:
+  validator4-data:
+  prometheus-data:
+  grafana-data:

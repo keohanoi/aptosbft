@@ -17,9 +17,14 @@ pub mod mempool_stream;
 pub mod ibc_headers;
 pub mod dydx_service;
 pub mod vote_extensions;
+pub mod genesis;
+pub mod network;
 
 pub use error::DydxAdapterError;
-pub use mempool_stream::{MempoolSyncStream, MempoolSyncConfig, create_mempool_sync_stream};
+pub use mempool_stream::{
+    MempoolSyncStream, MempoolSyncConfig, create_mempool_sync_stream,
+    QuorumStore, InMemoryQuorumStore, BatchTracker,
+};
 pub use ibc_headers::{
     SyntheticHeaderBuilder,
     create_header_builder,
@@ -35,6 +40,10 @@ pub use ibc_headers::{
     Address,
     ConsensusAddress,
     Bytes,
+    ValidatorRegistry,
+    ValidatorRegistryEntry,
+    ValidatorInfo,
+    InMemoryValidatorRegistry,
 };
 pub use types::{
     DydxBlock,
@@ -45,10 +54,20 @@ pub use types::{
     DydxSignature,
     DydxLedgerInfo,
     DydxBlockMetadata,
+    CometBFTValidatorSet,
+    CometBFTValidator,
+    ValidatorSetInfo,
+    DydxProposerElection,
 };
 pub use state_computer::DydxStateComputer;
 pub use vote_extensions::{
     DydxVoteExtension,
     DydxVoteExtensionGenerator,
     VoteExtensionGenerator,
+};
+pub use genesis::{
+    CometBFTGenesis,
+    CometBFTGenesisValidator,
+    MigratedGenesis,
+    write_migrated_genesis,
 };

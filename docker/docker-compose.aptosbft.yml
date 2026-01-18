@@ -1,0 +1,143 @@
+# Docker Compose configuration for dYdX v4 with AptosBFT consensus
+#
+# This compose file orchestrates the following services:
+# - aptosbft: AptosBFT consensus node (Rust)
+# - app: dYdX v4 application (Go/Cosmos SDK)
+#
+# Usage:
+#   docker-compose -f docker/docker-compose.aptosbft.yml up -d
+#   docker-compose -f docker/docker-compose.aptosbft.yml down
+
+version: '3.8'
+
+services:
+  # =============================================================================
+  # AptosBFT Consensus Node (Rust)
+  # =============================================================================
+  aptosbft:
+    build:
+      context: ../aptosbft
+      dockerfile: Dockerfile
+    container_name: dydx-aptosbft
+    restart: unless-stopped
+    environment:
+      # Rust logging
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+
+      # Configuration
+      - APTOSBFT_CONFIG=/etc/aptosbft/config.toml
+
+      # dYdX application endpoint (Go app)
+      - DYDX_APP_ENDPOINT=http://app:50051
+
+      # gRPC server bind address
+      - DYDX_GRPC_BIND_ADDRESS=0.0.0.0:50052
+
+      # Data directory
+      - DYDX_DATA_DIR=/var/lib/dydxaptosbft
+
+      # Log level
+      - DYDX_LOG_LEVEL=info
+
+      # Metrics
+      - METRICS_ENABLED=true
+      - METRICS_BIND_ADDRESS=0.0.0.0:9090
+
+    ports:
+      # "host:container"
+      - "50052:50052"  # gRPC server port (for AptosBFT bridge)
+      - "7000:7000"    # P2P network port (for AptosBFT consensus)
+      - "9090:9090"    # Metrics endpoint
+
+    volumes:
+      # Data persistence
+      - aptosbft-data:/var/lib/dydxaptosbft
+
+      # Configuration (optional)
+      # - ./config/aptosbft:/etc/aptosbft:ro
+
+    depends_on:
+      - app
+
+    networks:
+      - dydx-network
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:50051/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # =============================================================================
+  # dYdX v4 Application (Go/Cosmos SDK)
+  # =============================================================================
+  app:
+    image: dydxprotocol/v4-app:latest
+    container_name: dydx-app
+    restart: unless-stopped
+    environment:
+      # CometBFT/AptosBFT mode flag
+      - APTOSBFT_ENABLED=true
+
+      # AptosBFT bridge configuration
+      - APTOSBFT_ENDPOINT=aptosbft:50052
+
+      # Standard dYdX configuration
+      - CHAIN_ID=dydx-mainnet-1
+      - MONIKER=dydxprotocold
+
+      # Ports (standard dYdX ports)
+      - 1317:1317    # RPC (Tendermint RPC compatibility layer)
+      - 9090:9090    # gRPC
+      - 3003:3003    # Websocket (prices, orderbook, trades)
+
+    ports:
+      - "1317:1317"
+      - "9090:9090"
+      - "3003:3003"
+
+    volumes:
+      # Data persistence
+      - app-data:/dydx/data
+
+    networks:
+      - dydx-network
+
+  # =============================================================================
+  # Slinky Oracle Sidecar (Optional - for price data)
+  # =============================================================================
+  slinky:
+    image: dydxprotocol/slinky:latest
+    container_name: dydx-slinky
+    restart: unless-stopped
+    environment:
+      # Slinky configuration
+      - CHAIN_ID=dydx-mainnet-1
+
+      # Metrics
+      - PROMETHEUS_ENABLED=false
+
+    ports:
+      - "8080:8080"    # Slinky HTTP API
+
+    depends_on:
+      - app
+
+    networks:
+      - dydx-network
+
+# =============================================================================
+  # Networks
+  # =============================================================================
+networks:
+#  dydx-network:
+#    driver: bridge
+
+# =============================================================================
+# # Volumes
+# # =============================================================================
+# volumes:
+#   aptosbft-data:
+#   app-data:

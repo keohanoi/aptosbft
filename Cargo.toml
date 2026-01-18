@@ -6,6 +6,7 @@ members = [
     "consensus-grpc-protos",
     "consensus-grpc-server",
     "dydx-adapter",
+    "dydx-node",
 ]
 
 [workspace.package]

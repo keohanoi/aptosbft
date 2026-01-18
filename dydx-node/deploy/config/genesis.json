@@ -1,0 +1,54 @@
+{
+  "chain_id": "dydx-testnet-1",
+  "genesis_time": "2025-01-19T00:00:00Z",
+  "initial_height": 1,
+  "validators": [
+    {
+      "address": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      },
+      "power": "10",
+      "name": "validator1"
+    },
+    {
+      "address": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+      },
+      "power": "10",
+      "name": "validator2"
+    },
+    {
+      "address": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="
+      },
+      "power": "10",
+      "name": "validator3"
+    },
+    {
+      "address": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="
+      },
+      "power": "10",
+      "name": "validator4"
+    }
+  ],
+  "app_state": {},
+  "consensus_params": {
+    "block": {
+      "max_bytes": "5000000",
+      "max_gas": "-1"
+    },
+    "evidence": {
+      "max_age_num_blocks": "100000",
+      "max_age_duration": "172800000000000"
+    }
+  }
+}

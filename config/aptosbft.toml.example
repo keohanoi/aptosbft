@@ -1,0 +1,235 @@
+# AptosBFT Consensus Node Configuration
+#
+# This is an example configuration file for the dYdX AptosBFT consensus node.
+# Copy this file to config.toml and modify the values as needed.
+
+[aptosbft]
+# Consensus round timeout (seconds)
+# The time to wait before moving to the next round if no proposal is received
+round_timeout = 2
+
+# Number of rounds per epoch
+rounds_per_epoch = 1000
+
+# Initial round to start from
+initial_round = 0
+
+# Initial epoch number
+initial_epoch = 0
+
+# Enable DAG consensus for parallel blocks (experimental)
+dag_enabled = false
+
+# Enable metrics collection
+metrics_enabled = true
+
+# Metrics bind address
+metrics_bind_address = "0.0.0.0:9090"
+
+# Enable detailed logging
+debug_logging = false
+
+[network]
+# P2P bind address for AptosBFT consensus
+p2p_bind_address = "0.0.0.0:7000"
+
+# Seed nodes for initial network connection (comma-separated)
+# Format: "node_id@ip:port"
+seed_nodes = []
+
+# Maximum number of peers
+max_peers = 50
+
+# Maximum number of outbound peers
+max_outbound_peers = 20
+
+[network.connectivity]
+# Ping interval in milliseconds
+ping_interval_ms = 1000
+
+# Request timeout in milliseconds
+request_timeout_ms = 5000
+
+# Status update interval in milliseconds
+status_update_interval_ms = 1000
+
+[consensus]
+# Consensus engine type (aptosbft, cometbft)
+# Note: Only aptosbft is supported in this migration
+consensus_engine = "aptosbft"
+
+# Enable 2-chain commit rule (safety property)
+two_chain_enabled = true
+
+# Enable vote extensions
+vote_extensions_enabled = true
+
+# Vote extension timeout (milliseconds)
+vote_extension_timeout_ms = 500
+
+# Number of votes required for quorum (2/3 of voting power)
+quorum_threshold = 0.67
+
+[grpc_server]
+# gRPC server bind address for AptosBFT bridge
+bind_address = "0.0.0.0:50052"
+
+# gRPC server timeout (seconds)
+grpc_timeout = 10
+
+# Maximum concurrent connections
+max_connections = 100
+
+[dydx_bridge]
+# dYdX application endpoint (Go app)
+app_endpoint = "http://localhost:50051"
+
+# Connection timeout (seconds)
+connection_timeout = 5
+
+# Reconnection interval (seconds)
+reconnection_interval = 5
+
+# Maximum reconnection attempts before giving up
+max_reconnect_attempts = 10
+
+# Application state sync interval (milliseconds)
+state_sync_interval_ms = 100
+
+[mempool]
+# Enable mempool synchronization
+mempool_sync_enabled = true
+
+# Mempool batch size in bytes
+batch_size_bytes = 1048576
+
+# Mempool batch max transactions
+batch_max_txs = 1000
+
+# Stream timeout (milliseconds)
+stream_timeout_ms = 30000
+
+[validator]
+# Validator private key file path
+# This file should contain the Ed25519 private key for signing votes
+private_key_path = "/etc/aptosbft/validator_key.json"
+
+# Validator account address (hex string, 64 characters for Ed25519)
+# If not specified, will be derived from private key
+validator_address = ""
+
+# Maximum block size in bytes
+max_block_bytes = 1048576
+
+# Maximum gas limit per block
+max_block_gas = 30000000
+
+[slinky]
+# Slinky sidecar address for price oracle
+slinky_address = "localhost:8080"
+
+# Price update timeout (milliseconds)
+price_update_timeout_ms = 500
+
+# Maximum price age to accept (milliseconds)
+max_price_age_ms = 1000
+
+# Price data refresh interval (milliseconds)
+price_refresh_interval_ms = 100
+
+[genesis]
+# Genesis file path
+genesis_path = "/etc/aptosbft/genesis.json"
+
+# Initial validator set file
+validator_set_path = "/etc/aptosibt/validator_set.json"
+
+# Initial state root (hex string, 64 characters)
+initial_state_root = "0000000000000000000000000000000000000000000000000000000000000000000"
+
+[storage]
+# Data directory for state persistence
+data_dir = "/var/lib/dydxaptosbft"
+
+# State snapshot interval (blocks)
+snapshot_interval = 1000
+
+# Maximum number of snapshots to keep
+max_snapshots = 10
+
+# Enable state compaction
+enable_compaction = true
+
+# Compaction interval (blocks)
+compaction_interval = 10000
+
+[metrics]
+# Enable Prometheus metrics endpoint
+prometheus_enabled = true
+
+# Metrics bind address
+bind_address = "0.0.0.0:9090"
+
+# Metrics reporting interval (seconds)
+report_interval = 10
+
+# Include gRPC metrics
+include_grpc_metrics = true
+
+# Include consensus metrics
+include_consensus_metrics = true
+
+[logging]
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+# Log format: json, text
+log_format = "text"
+
+# Log output: stdout, file, both
+log_output = "stdout"
+
+# Log file path (if file logging is enabled)
+log_file_path = "/var/log/dydxaptosbft/app.log"
+
+# Enable logging to file
+log_to_file = false
+
+# Maximum log file size in MB before rotation
+max_log_size_mb = 100
+
+# Maximum log file age in days before rotation
+max_log_age_days = 30
+
+[crypto]
+# Crypto provider (ed25519, secp256k1)
+# Ed25519 is used for AptosBFT consensus
+crypto_provider = "ed25519"
+
+# Signature verification enabled
+verify_signatures = true
+
+# Cache signatures for performance
+cache_signatures = true
+
+# Signature cache size
+signature_cache_size = 1000
+
+[testing]
+# Enable test mode (for integration testing)
+test_mode = false
+
+# Mock Slinky responses for testing
+mock_slinky = false
+
+# Mock gRPC server responses for testing
+mock_grpc = false
+
+# Skip state sync in tests
+skip_state_sync = false
+
+# Disable certain validations in tests
+disable_timeout_checks = false
+
+# Test network simulation enabled
+test_network_simulation = false

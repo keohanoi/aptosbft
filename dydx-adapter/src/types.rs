@@ -20,9 +20,14 @@ use consensus_traits::{
     PublicKey,
     QuorumCertificate,
     ValidatorVerifier,
+    proposer::{ProposerElection, ProposerInfo, ReputationTracker},
+    core::Hash as CoreHash,
 };
 use consensus_traits::core::{Error as CoreError, VerifyError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use crate::error::DydxAdapterError;
 
 /// dYdX hash type (32-byte blake3 hash)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,7 +81,7 @@ impl fmt::Display for DydxHash {
 /// dYdX node identifier (validator address)
 ///
 /// Uses a fixed-size array for Copy trait requirement
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DydxNodeId(pub [u8; 32]);
 
 impl DydxNodeId {
@@ -86,11 +91,16 @@ impl DydxNodeId {
     }
 
     /// Create a node ID from a slice (pads with zeros if needed)
-    pub fn from_slice(slice: &[u8]) -> Self {
+    pub fn from_slice(slice: &[u8]) -> Result<Self, CoreError> {
+        if slice.len() > 32 {
+            return Err(CoreError::msg(format!(
+                "Node ID too long: {} bytes (max 32)",
+                slice.len()
+            )));
+        }
         let mut arr = [0u8; 32];
-        let len = slice.len().min(32);
-        arr[..len].copy_from_slice(&slice[..len]);
-        Self(arr)
+        arr[..slice.len()].copy_from_slice(slice);
+        Ok(Self(arr))
     }
 }
 
@@ -930,7 +940,7 @@ mod tests {
     #[test]
     fn test_node_id_from_slice() {
         let bytes = vec![1u8; 16];
-        let id = DydxNodeId::from_slice(&bytes);
+        let id = DydxNodeId::from_slice(&bytes).unwrap();
 
         // Verify first 16 bytes are copied
         assert_eq!(id.0[..16], bytes[..16]);
@@ -945,7 +955,7 @@ mod tests {
     #[test]
     fn test_node_id_from_slice_full() {
         let bytes = vec![5u8; 32];
-        let id = DydxNodeId::from_slice(&bytes);
+        let id = DydxNodeId::from_slice(&bytes).unwrap();
 
         // Verify all bytes are copied
         assert_eq!(id.0, bytes[..]);
@@ -954,7 +964,7 @@ mod tests {
     #[test]
     fn test_node_id_from_slice_empty() {
         let bytes = vec![];
-        let id = DydxNodeId::from_slice(&bytes);
+        let id = DydxNodeId::from_slice(&bytes).unwrap();
 
         // Verify all bytes are zero when empty input
         assert_eq!(id.0, [0u8; 32]);
@@ -1762,5 +1772,203 @@ mod tests {
         let result = DydxQuorumCert::form_from_votes(&votes, &validator_set);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Vote mismatch"));
+    }
+}
+
+/// =============================================================================
+/// Genesis & State Migration Utilities
+/// =============================================================================
+
+/// CometBFT Validator Set (from Tendermint genesis)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CometBFTValidatorSet {
+    pub validators: Vec<CometBFTValidator>,
+}
+
+/// CometBFT Validator information
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CometBFTValidator {
+    /// Validator address (32 bytes)
+    pub address: String,
+
+    /// Voting power
+    pub voting_power: u64,
+
+    /// Proposer priority (from genesis)
+    pub proposer_priority: Option<i64>,
+}
+
+/// dYdX ProposerElection strategy
+///
+/// Uses the dYdX validator set with weighted round-robin based on voting power.
+/// This ensures fair proposer selection proportional to stake weight.
+#[derive(Clone)]
+pub struct DydxProposerElection {
+    /// Validator addresses mapped to their voting power
+    validators: HashMap<DydxNodeId, u64>,
+
+    /// Total voting power
+    total_power: u64,
+
+    /// Current round number
+    current_round: u64,
+
+    /// Initial round number
+    initial_round: u64,
+}
+
+impl DydxProposerElection {
+    /// Create a new dYdX proposer election strategy.
+    pub fn new(validators: HashMap<DydxNodeId, u64>, total_power: u64) -> Self {
+        Self {
+            validators,
+            total_power,
+            current_round: 1,
+            initial_round: 1,
+        }
+    }
+
+    /// Get a validator by address.
+    pub fn get_validator(&self, address: &DydxNodeId) -> Option<&u64> {
+        self.validators.get(address)
+    }
+
+    /// Get the number of validators.
+    pub fn num_validators(&self) -> usize {
+        self.validators.len()
+    }
+}
+
+impl ProposerElection for DydxProposerElection {
+    type Round = u64;
+    type Author = DydxNodeId;
+
+    fn get_valid_proposer(&self, round: &Self::Round) -> Option<Self::Author> {
+        if self.validators.is_empty() {
+            return None;
+        }
+
+        if *round < self.initial_round {
+            return None;
+        }
+
+        // Sort validators by address for deterministic proposer selection
+        let mut validator_list: Vec<(&DydxNodeId, &u64)> = self.validators.iter().collect();
+        validator_list.sort_by(|a, b| a.0.cmp(b.0));
+
+        // Select proposer using weighted round-robin
+        let mut cumulative_power = 0u64;
+        let target_power = (*round) % self.total_power;
+
+        for (address, power) in &validator_list {
+            cumulative_power += *power;
+            if cumulative_power > target_power {
+                return Some(**address);
+            }
+        }
+
+        // Fallback to first validator if something went wrong
+        validator_list.first().map(|(addr, _power)| **addr)
+    }
+}
+
+/// Validator set information for migration from CometBFT to AptosBFT
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorSetInfo {
+    /// Validator addresses
+    pub validators: Vec<DydxNodeId>,
+
+    /// Voting power for each validator
+    pub voting_powers: Vec<u64>,
+
+    /// Total voting power
+    pub total_voting_power: u64,
+
+    /// Proposer priorities (optional)
+    pub proposer_priorities: Option<Vec<i64>>,
+}
+
+impl ValidatorSetInfo {
+    /// Create a new validator set info
+    pub fn new(
+        validators: Vec<DydxNodeId>,
+        voting_powers: Vec<u64>,
+        total_voting_power: u64,
+        proposer_priorities: Option<Vec<i64>>,
+    ) -> Result<Self, DydxAdapterError> {
+        if validators.len() != voting_powers.len() {
+            return Err(DydxAdapterError::msg(format!(
+                "Validators and voting powers length mismatch: {} vs {}",
+                validators.len(),
+                voting_powers.len()
+            )));
+        }
+
+        let total_power: u64 = voting_powers.iter().sum();
+
+        if total_power != total_voting_power {
+            return Err(DydxAdapterError::msg(format!(
+                "Sum of voting powers ({}) doesn't match total ({})",
+                total_power,
+                total_voting_power
+            )));
+        }
+
+        Ok(Self {
+            validators,
+            voting_powers,
+            total_voting_power,
+            proposer_priorities,
+        })
+    }
+
+    /// Convert from CometBFT genesis validators
+    pub fn from_cometbft_validators(
+        comet_validators: &CometBFTValidatorSet,
+    ) -> Result<Self, DydxAdapterError> {
+        let mut validators = vec![];
+        let mut voting_powers = vec![];
+        let mut proposer_priorities = vec![];
+
+        // Sort by address for determinism
+        let mut sorted_validators = comet_validators.validators.clone();
+        sorted_validators.sort_by(|a, b| a.address.cmp(&b.address));
+
+        for (_idx, val) in sorted_validators.iter().enumerate() {
+            // CometBFT addresses are hex-encoded, need to decode first
+            let address_bytes = hex::decode(&val.address)
+                .map_err(|e| DydxAdapterError::msg(format!("Invalid hex address: {}", e)))?;
+
+            let address = DydxNodeId::from_slice(&address_bytes)?;
+            validators.push(address);
+            voting_powers.push(val.voting_power);
+            proposer_priorities.push(val.proposer_priority.unwrap_or(0));
+        }
+
+        let total_voting_power: u64 = voting_powers.iter().sum();
+
+        Ok(Self {
+            validators,
+            voting_powers,
+            total_voting_power,
+            proposer_priorities: Some(proposer_priorities),
+        })
+    }
+
+    /// Convert to HashMap for ProposerElection
+    pub fn to_hash_map(&self) -> HashMap<DydxNodeId, u64> {
+        self.validators
+            .iter()
+            .zip(self.voting_powers.iter())
+            .map(|(addr, power)| (*addr, *power))
+            .collect()
+    }
+
+    /// Create weighted round-robin proposer
+    pub fn create_proposer_election(&self) -> DydxProposerElection {
+        DydxProposerElection::new(
+            self.to_hash_map(),
+            self.total_voting_power,
+        )
     }
 }

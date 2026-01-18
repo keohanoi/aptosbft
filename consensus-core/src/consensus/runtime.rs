@@ -219,6 +219,7 @@ where
 /// - `B`: Block type - must implement the [`Block`] trait
 /// - `V`: Vote type - must implement the [`Vote`] trait
 /// - `PE`: ProposerElection type - must implement the [`ProposerElection`] trait
+/// - `N`: Network type (optional - can be any type, will be used where ConsensusNetwork is needed)
 ///
 /// # Architecture
 ///
@@ -227,7 +228,7 @@ where
 /// - Network message handling
 /// - Background job processing
 /// - Graceful shutdown coordination
-pub struct ConsensusRuntime<B, V, PE>
+pub struct ConsensusRuntime<B, V, PE, N = ()>
 where
     B: Block + 'static,
     V: Vote<Block = B> + 'static,
@@ -240,6 +241,9 @@ where
 
     /// Runtime configuration
     config: RuntimeConfig,
+
+    /// P2P network interface (optional - if None, network is disabled)
+    network: Option<Arc<N>>,
 
     /// Pending network messages to process
     pending_messages: VecDeque<NetworkMessage<B, V>>,
@@ -256,13 +260,14 @@ where
 
 use std::collections::VecDeque;
 
-impl<B, V, PE> ConsensusRuntime<B, V, PE>
+impl<B, V, PE, N> ConsensusRuntime<B, V, PE, N>
 where
     B: Block + 'static,
     V: Vote<Block = B> + 'static,
     PE: ProposerElection<Round = u64> + Send + Sync + Clone + 'static,
     PE::Author: Clone + Debug + Display + Send + Sync + 'static,
     <B::Metadata as BlockMetadata>::QuorumCert: std::fmt::Debug,
+    N: Send + Sync + 'static,
 {
     /// Create a new consensus runtime.
     ///
@@ -270,10 +275,12 @@ where
     ///
     /// - `consensus`: The underlying consensus engine
     /// - `config`: Runtime configuration
-    pub fn new(consensus: Consensus<B, V, PE>, config: RuntimeConfig) -> Self {
+    /// - `network`: Optional P2P network interface
+    pub fn new(consensus: Consensus<B, V, PE>, config: RuntimeConfig, network: Option<Arc<N>>) -> Self {
         Self {
             consensus,
             config,
+            network,
             pending_messages: VecDeque::new(),
             active_tasks: Vec::new(),
             next_task_id: 0,
@@ -650,7 +657,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+        let runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+            consensus,
+            RuntimeConfig::default(),
+            None,
+        );
         assert!(!runtime.is_running());
         assert_eq!(runtime.pending_message_count(), 0);
     }
@@ -663,7 +674,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+        let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+            consensus,
+            RuntimeConfig::default(),
+            None,
+        );
         let block = Arc::new(MockBlock::genesis());
         runtime.add_network_message(NetworkMessage::Proposal { block });
 
@@ -678,7 +693,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+        let mut runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+            consensus,
+            RuntimeConfig::default(),
+            None,
+        );
 
         assert!(runtime.start().is_ok());
         assert!(runtime.is_running());
@@ -695,7 +714,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let runtime = ConsensusRuntime::new(consensus, RuntimeConfig::default());
+        let runtime = ConsensusRuntime::<MockBlock, MockVote, TestProposerElection, ()>::new(
+            consensus,
+            RuntimeConfig::default(),
+            None,
+        );
 
         assert_eq!(runtime.epoch(), 0);
         assert_eq!(runtime.round(), 0);
